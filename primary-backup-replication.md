@@ -1,363 +1,314 @@
-# Primary/Backup Replication
+6.824 2020 Lecture 4: Primary/Backup Replication
 
-<!-- TOC -->
+Today
+  Primary/Backup Replication for Fault Tolerance
+  Case study of VMware FT, an extreme version of the idea
 
-- [Primary/Backup Replication](#primarybackup-replication)
-  - [Fault tolerance](#fault-tolerance)
-    - [What failures will we try to cope with?](#what-failures-will-we-try-to-cope-with)
-    - [But not:](#but-not)
-    - [Behaviors](#behaviors)
-  - [Core idea: replication](#core-idea-replication)
-    - [Example: fault-tolerant MapReduce master](#example-fault-tolerant-mapreduce-master)
-    - [Big Questions:](#big-questions)
-  - [Two main approaches:](#two-main-approaches)
-    - [State transfer is simpler](#state-transfer-is-simpler)
-    - [Replicated state machine can be more efficient](#replicated-state-machine-can-be-more-efficient)
-    - [At what level to define a replicated state machine?](#at-what-level-to-define-a-replicated-state-machine)
-  - [The design of a Practical System for Fault-Tolerant Virtual Machines](#the-design-of-a-practical-system-for-fault-tolerant-virtual-machines)
-    - [Very ambitious system:](#very-ambitious-system)
-    - [Overview](#overview)
-      - [Why does this idea work?](#why-does-this-idea-work)
-      - [What sources of divergence must we guard against?](#what-sources-of-divergence-must-we-guard-against)
-      - [Examples of divergence?](#examples-of-divergence)
-      - [Example: timer interrupts](#example-timer-interrupts)
-      - [Example: disk/network input](#example-disknetwork-input)
-      - [Why the bounce buffer?](#why-the-bounce-buffer)
-      - [Note that the backup must lag by one event (one log entry)](#note-that-the-backup-must-lag-by-one-event-one-log-entry)
-      - [Example: non-functional instructions](#example-non-functional-instructions)
-      - [What about disk/network output?](#what-about-disknetwork-output)
-      - [Why the Output Rule?](#why-the-output-rule)
-      - [The Output Rule is a big deal](#the-output-rule-is-a-big-deal)
-    - [Performance (table 1)](#performance-table-1)
-    - [When might FT be attractive?](#when-might-ft-be-attractive)
-    - [What about replication for high-throughput services?](#what-about-replication-for-high-throughput-services)
-    - [Summary:](#summary)
-    - [VMware FT FAQ](#vmware-ft-faq)
+The topic is (still) fault tolerance
+  to provide availability
+  despite server and network failures
+  using replication
 
-<!-- /TOC -->
+What kinds of failures can replication deal with?
+  "fail-stop" failure of a single replica
+    fan stops working, CPU overheats and shuts itself down
+    someone trips over replica's power cord or network cable
+    software notices it is out of disk space and stops
+  Maybe not defects in h/w or bugs in s/w or human configuration errors
+    Often not fail-stop
+    May be correlated (i.e. cause all replicas to crash at the same time)
+    But, sometimes can be detected (e.g. checksums)
+  How about earthquake or city-wide power failure?
+    Only if replicas are physically separated
 
-- Primary/Backup Replication for Fault Tolerance
-- Case study of VMware FT, an extreme version of the idea
+Is replication worth the Nx expense?
 
-## Fault tolerance
+Two main replication approaches:
+  State transfer
+    Primary replica executes the service
+    Primary sends [new] state to backups
+  Replicated state machine
+    Clients send operations to primary,
+      primary sequences and sends to backups
+    All replicas execute all operations
+    If same start state,
+      same operations,
+      same order,
+      deterministic,
+      then same end state.
 
-- we'd like a service that continues despite failures
-- some ideal properties:
-  - available: still useable despite [some class of] failures
-  - strongly consistent: looks just like a single server to clients
-  - transparent to clients
-  - transparent to server software
-  - efficient
+State transfer is simpler
+  But state may be large, slow to transfer over network
 
-### What failures will we try to cope with?
+Replicated state machine often generates less network traffic
+  Operations are often small compared to state
+  But complex to get right
+  VM-FT uses replicated state machine, as do Labs 2/3/4
 
-- Fail-stop failures
-- Independent failures
-- Network drops some/all packets
-- Network partition
+Big Questions:
+  What state to replicate?
+  Does primary have to wait for backup?
+  When to cut over to backup?
+  Are anomalies visible at cut-over?
+  How to bring a replacement backup up to speed?
 
-### But not:
+At what level do we want replicas to be identical?
+  Application state, e.g. a database's tables?
+    GFS works this way
+    Can be efficient; primary only sends high-level operations to backup
+    Application code (server) must understand fault tolerance, to e.g. forward op stream
+  Machine level, e.g. registers and RAM content?
+    might allow us to replicate any existing server w/o modification!
+    requires forwarding of machine events (interrupts, DMA, &c)
+    requires "machine" modifications to send/recv event stream...
 
-- Incorrect execution
-- Correlated failures
-- Configuration errors
-- Malice
+Today's paper (VMware FT) replicates machine-level state
+  Transparent: can run any existing O/S and server software!
+  Appears like a single server to clients
 
-### Behaviors
+Overview
+  [diagram: app, O/S, VM-FT underneath, disk server, network, clients]
+  words:
+    hypervisor == monitor == VMM (virtual machine monitor)
+    O/S+app is the "guest" running inside a virtual machine
+  two machines, primary and backup
+  primary sends all external events (client packets &c) to backup over network
+    "logging channel", carrying log entries
+  ordinarily, backup's output is suppressed by FT
+  if either stops being able to talk to the other over the network
+    "goes live" and provides sole service
+    if primary goes live, it stops sending log entries to the backup
 
-- Available (e.g. if one server halts)
-- Wait (e.g. if network totally fails)
-- Stop forever (e.g. if multiple servers crash)
-- Malfunction (e.g. if h/w computes incorrectly, or software has a bug)
+VMM emulates a local disk interface
+  but actual storage is on a network server
+  treated much like a client:
+    usually only primary communicates with disk server (backup's FT discards)
+    if backup goes live, it talks to disk server
+  external disk makes creating a new backup faster (don't have to copy primary's disk)
 
-## Core idea: replication
+When does the primary have to send information to the backup?
+  Any time something happens that might cause their executions to diverge.
+  Anything that's not a deterministic consequence of executing instructions.
 
-- *Two* servers (or more)
-- Each replica keeps state needed for the service
-- If one replica fails, others can continue
+What sources of divergence must FT handle?
+  Most instructions execute identically on primary and backup.
+    As long as memory+registers are identical,
+      which we're assuming by induction.
+  Inputs from external world -- just network packets.
+    These appear as DMA'd data plus an interrupt.
+  Timing of interrupts.
+  Instructions that aren't functions of state, such as reading current time.
+  Not multi-core races, since uniprocessor only.
 
-### Example: fault-tolerant MapReduce master
+Why would divergence be a disaster?
+  b/c state on backup would differ from state on primary,
+    and if primary then failed, clients would see inconsistency.
+  Example: GFS lease expiration
+    Imagine we're replicating the GFS master
+    Chunkserver must send "please renew" msg before 60-second lease expires
+    Clock interrupt drives master's notion of time
+    Suppose chunkserver sends "please renew" just around 60 seconds
+    On primary, clock interrupt happens just after request arrives.
+      Primary copy of master renews the lease, to the same chunkserver.
+    On backup, clock interrupt happens just before request.
+      Backup copy of master expires the lease.
+    If primary fails, backup takes over, it will think there
+      is no lease, and grant it to a different chunkserver.
+      Then two chunkservers will have lease for same chunk.
+  So: backup must see same events,
+    in same order,
+    at same points in instruction stream.
 
-- lab 1 workers are already fault-tolerant, but not master
-  - master is a "single point of failure"
-- can we have two masters, in case one fails?
-- [diagram: M1, M2, workers]
-- state:
-  - worker list
-  - which jobs done
-  - which workers idle
-  - TCP connection state
-  - program memory and stack
-  - CPU registers
+Each log entry: instruction #, type, data.
 
-### Big Questions:
+FT's handling of timer interrupts
+  Goal: primary and backup should see interrupt at 
+        the same point in the instruction stream
+  Primary:
+    FT fields the timer interrupt
+    FT reads instruction number from CPU
+    FT sends "timer interrupt at instruction X" on logging channel
+    FT delivers interrupt to primary, and resumes it
+    (this relies on CPU support to interrupt after the X'th instruction)
+  Backup:
+    ignores its own timer hardware
+    FT sees log entry *before* backup gets to instruction X
+    FT tells CPU to interrupt (to FT) at instruction X
+    FT mimics a timer interrupt to backup
 
-- What state to replicate?
-- Does primary have to wait for backup?
-- When to cut over to backup?
-- Are anomalies visible at cut-over?
-- How to bring a replacement up to speed?
+FT's handling of network packet arrival (input)
+  Primary:
+    FT tells NIC to copy packet data into FT's private "bounce buffer"
+    At some point NIC does DMA, then interrupts
+    FT gets the interrupt
+    FT pauses the primary
+    FT copies the bounce buffer into the primary's memory
+    FT simulates a NIC interrupt in primary
+    FT sends the packet data and the instruction # to the backup
+  Backup:
+    FT gets data and instruction # from log stream
+    FT tells CPU to interrupt (to FT) at instruction X
+    FT copies the data to backup memory, simulates NIC interrupt in backup
 
-## Two main approaches:
+Why the bounce buffer?
+  We want the data to appear in memory at exactly the same point in
+    execution of the primary and backup.
+  Otherwise they may diverge.
 
-- State transfer
-  - "Primary" replica executes the service
-  - Primary sends [new] state to backups
-- Replicated state machine
-  - All replicas execute all operations
-  - If same start state,
-    - same operations,
-    - same order,
-    - deterministic,
-    - then same end state
+Note that the backup must lag by one one log entry
+  Suppose primary gets an interrupt, or input, after instruction X
+  If backup has already executed past X, it cannot handle the input correctly
+  So backup FT can't start executing at all until it sees the first log entry
+    Then it executes just to the instruction # in that log entry
+    And waits for the next log entry before resuming backup
 
-### State transfer is simpler
+Example: non-deterministic instructions
+  some instructions yield different results even if primary/backup have same state
+  e.g. reading the current time or cycle count or processor serial #
+  Primary:
+    FT sets up the CPU to interrupt if primary executes such an instruction
+    FT executes the instruction and records the result
+    sends result and instruction # to backup
+  Backup:
+    FT reads log entry, sets up for interrupt at instruction #
+    FT then supplies value that the primary got
 
-- But state may be large, slow to transfer
-- VM-FT uses replicated state machine
+What about output (sending network packets)?
+  Primary and backup both execute instructions for output
+  Primary's FT actually does the output
+  Backup's FT discards the output
 
-### Replicated state machine can be more efficient
+Output example: DB server
+  clients can send "increment" request
+    DB increments stored value, replies with new value
+  so:
+    [diagram]
+    suppose the server's value starts out at 10
+    network delivers client request to FT on primary
+    primary's FT sends on logging channel to backup
+    FTs deliver request to primary and backup
+    primary executes, sets value to 11, sends "11" reply, FT really sends reply
+    backup executes, sets value to 11, sends "11" reply, and FT discards
+    the client gets one "11" response, as expected
 
-- If operations are small compared to data
-- But complex to get right
-- Labs 2/3/4 use replicated state machines
+But wait:
+  suppose primary crashes just after sending the reply
+    so client got the "11" reply
+  AND the logging channel discards the log entry w/ client request
+    primary is dead, so it won't re-send
+  backup goes live
+    but it has value "10" in its memory!
+  now a client sends another increment request
+    it will get "11" again, not "12"
+  oops
 
-### At what level to define a replicated state machine?
+Solution: the Output Rule (Section 2.2)
+  before primary sends output,
+  must wait for backup to acknowledge all previous log entries
 
-- K/V put and get?
-  - "application-level" RSM
-  - usually requires server and client modifications
-  - can be efficient; primary only sends high-level operations to backup
-- x86 instructions?
-  - might allow us to replicate any existing server w/o modification!
-  - but requires much more detailed primary/backup synchronization
-  - and we have to deal with interrupts, DMA, weird x86 instructions
+Again, with output rule:
+  [diagram]
+  primary:
+    receives client "increment" request
+    sends client request on logging channel
+    about to send "11" reply to client
+    first waits for backup to acknowledge previous log entry
+    then sends "11" reply to client
+  suppose the primary crashes at some point in this sequence
+  if before primary receives acknowledgement from backup
+    maybe backup didn't see client's request, and didn't increment
+    but also primary won't have replied
+  if after primary receives acknowledgement from backup
+    then client may see "11" reply
+    but backup guaranteed to have received log entry w/ client's request
+    so backup will increment to 11
 
-## The design of a Practical System for Fault-Tolerant Virtual Machines
-
-> [The design of a Practical System for Fault-Tolerant Virtual Machines](the-design-of-a-practical-system-for-fault-tolerant-virtual-machines.pdf)
-> Scales, Nelson, and Venkitachalam, SIGOPS OSR Vol 44, No 4, Dec 2010
-
-### Very ambitious system:
-
-- Goal: fault-tolerance for existing server software
-- Goal: clients should not notice a failure
-- Goal: no changes required to client or server software
-- Very ambitious!
-
-### Overview
-
-- [diagram: app, O/S, VM-FT underneath, shared disk, network, clients]
-- words:
-  - hypervisor == monitor == VMM (virtual machine monitor)
-  - app and O/S are "guest" running inside a virtual machine
-- two machines, primary and backup
-- shared disk for persistent storage
-  - shared so that bringing up a new backup is faster
-- primary sends all inputs to backup over logging channel
-
-#### Why does this idea work?
-
-- It's a replicated state machine
-- Primary and backup boot with same initial state (memory, disk files)
-- Same instructions, same inputs -> same execution
-  - All else being equal, primary and backup will remain identical
-
-#### What sources of divergence must we guard against?
-
-- Many instructions are guaranteed to execute exactly the same on primary and backup.
-  - As long as memory+registers are identical, which we're assuming by induction.
-- When might execution on primary differ from backup?
-  - Inputs from external world (the network).
-  - Data read from storage server.
-  - Timing of interrupts.
-  - Instructions that aren't pure functions of state, such as cycle counter.
-  - Races.
-
-#### Examples of divergence?
-
-- They all sound like "if primary fails, clients will see inconsistent story from backup."
-- Lock server grants lock to client C1, rejects later request from C2.
-  - Primary and backup had better agree on input order!
-  - Otherwise, primary fails, backup now tells clients that C2 holds the lock.
-- Lock server revokes lock after one minute.
-  - Suppose C1 holds the lock, and the minute is almost exactly up.
-  - C2 requests the lock.
-  - Primary might see C2's request just before timer interrupt, reject.
-  - Backup might see C2's request just after timer interrupt, grant.
-- So: backup must see same events, in same order, at same point in instruction stream.
-
-#### Example: timer interrupts
-
-- Goal: primary and backup should see interrupt at exactly the same point in execution
-  - i.e. between the same pair of executed instructions
-- Primary:
-  - FT fields the timer interrupt
-  - FT reads instruction number from CPU
-  - FT sends "timer interrupt at instruction X" on logging channel
-  - FT delivers interrupt to primary, and resumes it
-  - (this relies on special support from CPU to count instructions, interrupt after X)
-- Backup:
-  - ignores its own timer hardware
-  - FT sees log entry *before* backup gets to instruction X
-  - FT tells CPU to interrupt at instruction X
-  - FT mimics a timer interrupt, resumes backup
-
-#### Example: disk/network input
-
-- Primary and backup *both* ask h/w to read
-  - FT intercepts, ignores on backup, gives to real h/w on primary
-- Primary:
-  - FT tells the h/w to DMA data into FT's private "bounce buffer"
-  - At some point h/w does DMA, then interrupts
-  - FT gets the interrupt
-  - FT pauses the primary
-  - FT copies the bounce buffer into the primary's memory
-  - FT simulates an interrupt to primary, resumes it
-  - FT sends the data and the instruction # to the backup
-- Backup:
-  - FT gets data and instruction # from log stream
-  - FT tells CPU to interrupt at instruction X
-  - FT copies the data during interrupt
-
-#### Why the bounce buffer?
-
-- I.e. why wait until primary/backup aren't executing before copying the data?
-- We want the data to appear in memory at exactly the same point in
-  - execution of the primary and backup.
-- Otherwise they may diverge.
-
-#### Note that the backup must lag by one event (one log entry)
-
-- Suppose primary gets an interrupt, or input, after instruction X
-- If backup has already executed past X, it cannot handle the input correctly
-- So backup FT can't start executing at all until it sees the first log entry
-  - Then it executes just to the instruction # in that log entry
-  - And waits for the next log entry before restarting backup
-
-#### Example: non-functional instructions
-
-- even if primary and backup have same memory/registers,
-  - some instructions still execute differently
-- e.g. reading the current time or cycle count or processor serial #
-- Primary:
-  - FT sets up the CPU to interrupt if primary executes such an instruction
-  - FT executes the instruction and records the result
-  - sends result and instruction # to backup
-- Backup:
-  - backup also interrupts when it tries to execute that instruction
-  - FT supplies value that the primary got
-
-#### What about disk/network output?
-
-- Primary and backup both execute instructions for output
-- Primary's FT actually does the output
-- Backup's FT discards the output
-
-But: the paper's Output Rule (Section 2.2) says primary primary must tell backup when it produces output, and delay the output until the backup says it has received the log entry.
-
-#### Why the Output Rule?
-
-- Suppose there was no Output Rule.
-- The primary emits output immediately.
-- Suppose the primary has seen inputs I1 I2 I3, then emits output.
-- The backup has received I1 and I2 on the log.
-- The primary crashes and the packet for I3 is lost by the network.
-- Now the backup will go live without having processed I3.
-  - But some client has seen output reflecting the primary having executed I3.
-  - So that client may see anomalous state if it talks to the service again.
-- So: the primary doesn't emit output until it knows that the backup
-  - has seen all inputs up to that output.
-
-#### The Output Rule is a big deal
-
-- Occurs in some form in all replication systems
-- A serious constraint on performance
-- An area for application-specific cleverness
-  - Eg. maybe no need for primary to wait before replying to read-only operation
-- FT has no application-level knowledge, must be conservative
+The Output Rule is a big deal
+  Occurs in some form in all replication systems
+  A serious constraint on performance
+  An area for application-specific cleverness
+    Eg. maybe no need for primary to wait before replying to read-only operation
+  FT has no application-level knowledge, must be conservative
 
 Q: What if the primary crashes just after getting ACK from backup,
+   but before the primary emits the output?
+   Does this mean that the output won't ever be generated?
 
-- but before the primary emits the output?
-- Does this mean that the output won't ever be generated?
-
-A: Here's what happens when the primary fails and the backup takes over.
-
-- The backup got some log entries from the primary.
-- The backup continues executing those log entries WITH OUTPUT SUPPRESSED.
-- After the last log entry, the backup starts emitting output
-- In our example, the last log entry is I3
-- So after input I3, the client will start emitting outputs
-- And thus it will emit the output that the primary failed to emit
+A: Here's what happens when the primary fails and the backup goes live.
+   The backup got some log entries from the primary.
+   The backup continues executing those log entries WITH OUTPUT DISCARDED.
+   After the last log entry, the backup goes live -- stops discarding output
+   In our example, the last log entry is arrival of client request
+   So after client request arrives, the client will start emitting outputs
+   And thus it will emit the reply to the client
 
 Q: But what if the primary crashed *after* emitting the output?
-
-- Will the backup emit the output a *second* time?
+   Will the backup emit the output a *second* time?
 
 A: Yes.
-
-- OK for TCP, since receivers ignore duplicate sequence numbers.
-- OK for writes to shared disk, since backup will write same data to same block #.
+   OK for TCP, since receivers ignore duplicate sequence numbers.
+   OK for writes to disk, since backup will write same data to same block #.
 
 Duplicate output at cut-over is pretty common in replication systems
-
-- Not always possible for clients &c to ignore duplicates
-- For example, if output is vending money from an ATM machine
+  Clients need to keep enough state to ignore duplicates
+  Or be designed so that duplicates are harmless
 
 Q: Does FT cope with network partition -- could it suffer from split brain?
+   E.g. if primary and backup both think the other is down.
+   Will they both go live?
 
-- E.g. if primary and backup both think the other is down.
-- Will they both "go live"?
+A: The disk server breaks the tie.
+   Disk server supports atomic test-and-set.
+   If primary or backup thinks other is dead, attempts test-and-set.
+   If only one is alive, it will win test-and-set and go live.
+   If both try, one will lose, and halt.
 
-A: The shared disk breaks the tie.
-
-- Shared disk server supports atomic test-and-set.
-- Only one of primary/backup can successfully test-and-set.
-- If only one is alive, it will win test-and-set and go live.
-- If both try, one will lose, and halt.
-
-Shared storage is single point of failure
-
-- If shared storage is down, service is down
-- Maybe they have in mind a replicated storage system
+The disk server may be a single point of failure
+  If disk server is down, service is down
+  They probably have in mind a replicated disk server
 
 Q: Why don't they support multi-core?
 
-### Performance (table 1)
+Performance (table 1)
+  FT/Non-FT: impressive!
+    little slow down
+  Logging bandwidth
+    Directly reflects disk read rate + network input rate
+    18 Mbit/s for my-sql
+  These numbers seem low to me
+    Applications can read a disk at at least 400 megabits/second
+    So their applications aren't very disk-intensive
 
-- FT/Non-FT: impressive!
-  - little slow down
-- Logging bandwidth
-  - Directly reflects disk read rate + network input rate
-  - 18 Mbit/s for my-sql
-- These numbers seem low to me
-  - Applications can read a disk at at least 400 megabits/second
-  - So their applications aren't very disk-intensive
+When might FT be attractive?
+  Critical but low-intensity services, e.g. name server.
+  Services whose software is not convenient to modify.
 
-### When might FT be attractive?
+What about replication for high-throughput services?
+  People use application-level replicated state machines for e.g. databases.
+    The state is just the DB, not all of memory+disk.
+    The events are DB commands (put or get), not packets and interrupts.
+  Result: less fine-grained synchronization, less overhead.
+  GFS use application-level replication, as do Lab 2 &c
 
-- Critical but low-intensity services, e.g. name server.
-- Services whose software is not convenient to modify.
+Summary:
+  Primary-backup replication
+    VM-FT: clean example
+  How to cope with partition without single point of failure?
+    Next lecture
+  How to get better performance?
+    Application-level replicated state machines
+  
+----
 
-### What about replication for high-throughput services?
+VMware KB (#1013428) talks about multi-CPU support.  VM-FT may have switched
+from a replicated state machine approach to the state transfer approach, but
+unclear whether that is true or not.
 
-- People use application-level replicated state machines for e.g. databases.
-  - The state is just the DB, not all of memory+disk.
-  - The events are DB commands (put or get), not packets and interrupts.
-- Result: less fine-grained synchronization, less overhead.
-- GFS use application-level replication, as do Lab 2 &c
+http://www.wooditwork.com/2014/08/26/whats-new-vsphere-6-0-fault-tolerance/
 
-### Summary:
+http://www-mount.ece.umn.edu/~jjyi/MoBS/2007/program/01C-Xu.pdf
 
-- Primary-backup replication
-  - VM-FT: clean example
-- How to cope with partition without single point of failure?
-  - Next lecture
-- How to get better performance?
-  - Application-level replicated state machines
-
-### VMware FT FAQ
+VMware FT FAQ
 
 Q: The introduction says that it is more difficult to ensure
 deterministic execution on physical servers than on VMs. Why is this
@@ -435,7 +386,6 @@ server is dead, and thus that it should take over by itself, it first
 sends a test-and-set operation to the disk server. The server executes
 roughly this code:
 
-``` pseudocode
   test-and-set() {
     acquire_lock()
     if flag == true:
@@ -445,7 +395,6 @@ roughly this code:
       flag = true
       release_lock()
       return true
-```
 
 The primary (or backup) only takes over ("goes live") if test-and-set
 returns true.
@@ -484,8 +433,8 @@ OSes well, and will be aware of many of the pitfalls. For VM-FT
 specifically, the authors leverage the log and replay support from a
 previous a project (deterministic replay), which must have already
 dealt with sources of non-determinism. I assume the designers of
-deterministic replay did extensive testing and gained much experience
-with sources of non-determinism that authors of VM-FT leverage.
+deterministic replay did extensive testing and gained experience
+with sources of non-determinism that the authors of VM-FT use.
 
 Q: What happens if the primary fails just after it sends output to the
 external world?
@@ -497,7 +446,10 @@ client's TCP software will discard the duplicate automatically. If the
 output event is a disk I/O, disk I/Os are idempotent (both write the
 same data to the same location, and there are no intervening I/Os).
 
-Q: Section 3.4 talks about disk I/Os that are outstanding on the primary when a failure happens; it says "Instead, we re-issue the pending I/Os during the go-live process of the backup VM." Where are the pending I/Os located/stored, and how far back does the re-issuing
+Q: Section 3.4 talks about disk I/Os that are outstanding on the
+primary when a failure happens; it says "Instead, we re-issue the
+pending I/Os during the go-live process of the backup VM." Where are
+the pending I/Os located/stored, and how far back does the re-issuing
 need to go?
 
 A: The paper is talking about disk I/Os for which there is a log entry
@@ -508,6 +460,14 @@ interrupt. So, if the I/O completion interrupt is missing in the log,
 then the backup restarts the I/O. If there is an I/O completion
 interrupt in the log, then there is no need to restart the I/O.
 
+Q: How is the backup FT able to deliver an interrupt at a particular
+point in the backup instruction stream (i.e. at the same instruction
+at which the interrupt originally occured on the primary)?
+
+A: Many CPUs support a feature (the "performance counters") that
+lets the FT VMM tell the CPU a number of instructions, and the CPU
+will interrupt to the FT VMM after that number of instructions.
+
 Q: How secure is this system?
 
 A: The authors assume that the primary and backup follow the protocol
@@ -516,12 +476,15 @@ hypervisors). The system cannot handle compromised hypervisors. On the
 other hand, the hypervisor can probably defend itself against
 malicious or buggy guest operating systems and applications.
 
-Q: Is it reasonable to address only the fail-stop failures? What are other type of failures?
+Q: Is it reasonable to address only the fail-stop failures? What are
+other type of failures?
 
-A: It is reasonable, since many real-world failures are essentially fail-stop, for example many network and power failures. Doing better
+A: It is reasonable, since many real-world failures are essentially
+fail-stop, for example many network and power failures. Doing better
 than this requires coping with computers that appear to be operating
 correctly but actually compute incorrect results; in the worst case,
 perhaps the failure is the result of a malicious attacker. This larger
 class of non-fail-stop failures is often called "Byzantine". There are
 ways to deal with Byzantine failures, which we'll touch on at the end
 of the course, but most of 6.824 is about fail-stop failures.
+

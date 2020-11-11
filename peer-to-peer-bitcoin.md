@@ -1,30 +1,32 @@
-## LEC 21: Peer-to-peer: Bitcoin
-
-6.824 2018 Lecture 20: Bitcoin
+6.824 2020 Lecture 19: Bitcoin
 
 Bitcoin: A Peer-to-Peer Electronic Cash System, by Satoshi Nakamoto, 2008
 
-bitcoin:
-  a digital currency
-  a public ledger to prevent double-spending
-  no centralized trust or mechanism <-- this is hard!
-  malicious users ("Byzantine faults")
+why this paper?
+  like Raft -- state, log of operations, agreement on log content and thus state
+  unlike Raft -- many participants are certain to be malicious -- but which?
+  more distributed than most systems -- decentralized, peer-to-peer
+    identities of participants are not known, not even the number
+  the agreement scheme is new and very interesting
+  Bitcoin's success was a big surprise
 
 why might people want a digital currency?
-  might make online payments easier
+  might make online payments easier, faster, lower fees
   credit cards have worked well but aren't perfect
     insecure -> fraud -> fees, restrictions, reversals
     record of all your purchases
+  might reduce trust required in various entities (banks, governments)
 
-what's hard technically?
-  forgery
-  double spending
-  theft
+what are the technical challenges?
+  outright forgery (easy to solve)
+  double spending (hard, bitcoin does pretty well)
+  theft (hard, bitcoin not particularly strong)
 
 what's hard socially/economically?
-  why do Bitcoins have value?
+  how to persuade people that bitcoin has value?
+  how to make a currency that's useful for commerce, storing value?
   how to pay for infrastructure?
-  monetary policy (intentional inflation &c)
+  monetary policy (stimulus, control inflation, &c)
   laws (taxes, laundering, drugs, terrorists)
 
 idea: signed sequence of transactions
@@ -38,10 +40,11 @@ what's in a transaction record?
   pub(user1): public key of new owner
   hash(prev): hash of this coin's previous transaction record
   sig(user2): signature over transaction by previous owner's private key
-  (BitCoin is much more complex: amount (fractional), multiple in/out, ...)
+  (BitCoin is more complex: amount (fractional), multiple in/out, ...)
 
 transaction example:
   Y owns a coin, previously given to it by X:
+    T6: pub(X), ...
     T7: pub(Y), hash(T6), sig(X)
   Y buys a hamburger from Z and pays with this coin
     Z sends public key to Y
@@ -49,16 +52,17 @@ transaction example:
     T8: pub(Z), hash(T7), sig(Y)
   Y sends transaction record to Z
   Z verifies:
-    T8's sig() corresponds to T7's pub()
+    T8's sig(Y) corresponds to T7's pub(Y)
   Z gives hamburger to Y
 
-Z's "balance" is set of unspent transactions for which Z knows private key
+only the transactions exist, not the coins themselves
+  Z's "balance" is set of unspent transactions for which Z knows private key
   the "identity" of a coin is the (hash of) its most recent xaction
-  Z "owns" a coin = Z knows private key for "new owner" public key in latest xaction
 
 can anyone other than the owner spend a coin?
   current owner's private key needed to sign next transaction
-  danger: attacker can steal Z's private key, e.g. from PC or smartphone
+  danger: attacker can steal Z's private key, e.g. from PC or smartphone or online exchange
+    this is a serious problem in practice, and hard to solve well
 
 can a coin's owner spend it twice in this scheme?
   Y creates two transactions for same coin: Y->Z, Y->Q
@@ -68,54 +72,52 @@ can a coin's owner spend it twice in this scheme?
   now both Z and Q will give hamburgers to Y
 
 why was double-spending possible?
-  b/c Z and Q didn't know complete set of transactions
+  b/c Z and Q didn't know complete set and order of transactions
 
 what do we need?
-  publish log of all transactions to everyone, in same order
-    so Q knows about Y->Z, and will reject Y->Q
-    a "public ledger"
+  publish a log of all transactions
+  ensure everyone sees the same log (in same order!)
   ensure Y can't un-publish a transaction
-
-why not rely on CitiBank, or Federal Reserve, to publish transactions?
-  not everyone trusts them
-  they might be tempted to reverse or restrict
+  result:
+    Z will see Y->Z came before Y->Q, and will accept Y->Z
+    Q will see Y->Z came before Y->Q, and will reject Y->Q
+    a "public ledger"
 
 why not publish transactions like this:
   1000s of peers, run by anybody, no trust required in any one peer
-  peers flood new transactions over "overlay"
-  transaction Y->Z only acceptable if majority of peers think it is valid
-    i.e. they don't know of any Y->Q
-    hopefully majority overlap ensures double-spend is detected
+  transactions are sent to all peers
+  peers vote on which transaction to append next to the log; majority wins
+    assumes a majority are honest, will agree and out-vote malicious minority
   how to count votes?
     how to even count peers so you know what a majority is?
     perhaps distinct IP addresses?
   problem: "sybil attack"
-    IP addresses are not secure -- easy to forge
-    attacker pretends to have 10,000 computers -- majority
-    when Z asks, attacker's majority says "we only know of Y->Z"
-    when Q asks, attacker's majority says "we only know of Y->Q"
-  voting is hard in "open" p2p schemes
+    IP addresses are not secure -- easy to forge, or botnets of real computers
+    attacker pretends to have a vast number of computers -- majority
+    when Z asks, attacker's majority says "Y->Z is in log before Y->Q"
+    when Q asks, attacker's majority says "Y->Q is in log before Y->Z"
+  voting is hard in "open" schemes!
 
 the BitCoin block chain
   the goal: agreement on transaction log to prevent double-spending
   the block chain contains transactions on all coins
   many peers
     each with a complete copy of the whole chain
-    proposed transactions flooded to all peers
-    new blocks flooded to all peers
+    each with TCP connections to a few other peers -- a "mesh overlay"
+    new blocks flooded to all peers, by forwarding over TCP
+    proposed transactions also flooded to all peers
   each block:
     hash(prevblock)
     set of transactions
-    "nonce" (not quite a nonce in the usual cryptographic sense)
+    "nonce" (can be anything, as we'll see)
     current time (wall clock timestamp)
   new block every 10 minutes containing xactions since prev block
-  payee doesn't believe transaction until it's in the block chain
+  payee doesn't accept transaction until it's in the block chain
 
 who creates each new block?
-  this is "mining"
-  all peers try
+  this is "mining" via "proof-of-work"
   requirement: hash(block) has N leading zeros
-  each peer tries nonce values until this works out
+  each peer tries random nonce values until this works out
   trying one nonce is fast, but most nonces won't work
     it's like flipping a zillion-sided coin until it comes up heads
     each flip has an independent (small) chance of success
@@ -123,36 +125,44 @@ who creates each new block?
   it would likely take one CPU months to create one block
   but thousands of peers are working on it
   such that expected time to first to find is about 10 minutes
+    though the variance is high
   the winner floods the new block to all peers
+  proof-of-work solves the Sybil problem -- your CPU must be real to win
 
 how does a Y->Z transaction work w/ block chain?
   start: all peers know ...<-B5
-    and are working on B6 (trying different nonces)
+    and are mining block B6 (trying different nonces)
   Y sends Y->Z transaction to peers, which flood it
   peers buffer the transaction until B6 computed
   peers that heard Y->Z include it in next block
   so eventually ...<-B5<-B6<-B7, where B7 includes Y->Z
 
 Q: could there be *two* different successors to B6?
-A: yes, in (at least) two situations:
-   1) two peers both get lucky (unlikely, given variance of block time)
-   2) network partition
-  in both cases, the blockchain temporarily forks
-    peers work on whichever block they heard about before
+A: yes:
+   1) two peers find nonces at about the same time, or
+   2) slow network, 2nd block found before 1st is known
+  two simultaneous blocks will be different
+    miners know about slightly different sets of new transactions, &c.
+  if two successors, the blockchain temporarily forks
+    peers work on whichever block they heard first
     but switch to longer chain if they become aware of one
 
-how is a forked chain resolved?
-  each peer initially believes whichever of BZ/BQ it saw first
+how is a fork resolved?
+  each peer initially believes whatever new block it sees first
   tries to create a successor
-  if many more saw BZ than BQ, more will mine for BZ,
-    so BZ successor likely to be created first
-  if exactly half-and-half, one fork likely to be extended first
-    since significant variance in mining success time
-  peers always switch to mining the longest fork, re-inforcing agreement
+  if more saw Bx than By, more will mine for Bx,
+    so Bx successor likely to be created first
+  even if exactly half-and-half, one fork likely to be extended first
+    since significant variance in mining time
+  peers switch to mining the longest fork once they see it, re-inforcing agreement
+  what about transactions in the abandoned fork?
+    most will be in both forks
+    but some may be in just the abandoned fork -- appear, then disappear!
 
 what if Y sends out Y->Z and Y->Q at the same time?
   i.e. Y attempts to double-spend
-  no correct peer will accept both, so a block will have one but not both
+  correct peers will accept first they see, ignore second
+  thus next block will have one but not both
 
 what happens if Y tells some peers about Y->Z, others about Y->Q?
   perhaps use network DoS to prevent full flooding of either
@@ -160,7 +170,7 @@ what happens if Y tells some peers about Y->Z, others about Y->Q?
 
 thus:
   temporary double spending is possible, due to forks
-  but one side or the other of the fork highly likely to disappear
+  but one side or the other of the fork highly likely to disappear soon
   thus if Z sees Y->Z with a few blocks after it,
     it's very unlikely that it could be overtaken by a
     different fork containing Y->Q
@@ -169,28 +179,28 @@ thus:
   if Z is selling something cheap, maybe OK to wait just for some peers
     to see Y->Z and validate it (but not in block)
 
-can an attacker modify a block in the middle of the block chain?
-  not directly, since subsequent block holds block's hash
+can an attacker modify just an existing block in the middle of the block chain?
+  and tell newly starting peers about the modified block?
+  e.g. to delete the first spend of the attacker's coin?
+  no: then "prev" hash in next block will be wrong, peers will detect
 
 could attacker start a fork from an old block, with Y->Q instead of Y->Z?
   yes -- but fork must be longer in order for peers to accept it
-  so if attacker starts N blocks behind, it must generate N+M+1
-    blocks on its fork before main fork is extended by M
-  i.e. attacker must mine blocks *faster* than the other peers
+  since attacker's fork starts behind main fork,
+    attacker must mine blocks *faster* than total of other peers
   with just one CPU, will take months to create even a few blocks
     by that time the main chain will be much longer
     no peer will switch to the attacker's shorter chain
-  if the attacker has 1000s of CPUs -- more than all the honest
+  if the attacker has more CPU power than all the honest
     bitcoin peers -- then the attacker can create the longest fork,
     everyone will switch to it, allowing the attacker to double-spend
 
-there's a majority voting system hiding here
-  peers cast votes by mining to extend the longest chain
-
-summary:
-  if attacker controls majority of CPU power, can force honest
+why does the mining scheme work?
+  random choice over all participants for who gets to choose which fork to extend
+    weighted by CPU power
+  if most participants are honest, they will re-inforce agreement on longest fork
+  if attacker controls majority of CPU power, it can force honest
     peers to switch from real chain to one created by the attacker
-  otherwise not
 
 validation checks:
   peer, new xaction:
@@ -214,9 +224,11 @@ where does each bitcoin originally come from?
   it puts its public key in a special transaction in the block
   this is incentive for people to operate bitcoin peers
 
-Q: what if lots of miners join, so blocks are created faster?
-
 Q: 10 minutes is annoying; could it be made much shorter?
+
+Q: if lots of miners join, will blocks be created at a higher rate?
+
+Q: why does Bitcoin extend the longest chain? why not some other rule?
 
 Q: are transactions anonymous?
 
@@ -231,6 +243,7 @@ Q: what can adversary do with a majority of CPU power in the world?
 
 Q: what if the block format needs to be changed?
    esp if new format wouldn't be acceptable to previous s/w version?
+   "hard fork"
 
 Q: how do peers find each other?
 
@@ -249,32 +262,43 @@ Q: is it a problem that there will be a fixed number of coins?
    what if the real economy grows (or shrinks)?
 
 Q: why do bitcoins have value?
-   e.g., 1 BTC appears to be around $8700 on may 14 2018.
+   e.g. people seem willing to pay $8,935 per bitcoin (on may 5 2020).
 
 Q: will bitcoin scale well?
-   as transaction rate increases?
-     claim CPU limits to 4,000 tps (signature checks)
+   in terms of CPU time?
+     apparently CPU limits to 4,000 tps (signature checks)
      more than Visa but less than cash
-   as block chain length increases?
+   in terms of storage?
      do you ever need to look at very old blocks?
      do you ever need to xfer the whole block chain?
      merkle tree: block headers vs txn data.
-   sadly, the maximum block size is limited to one megabyte
+   in terms of network traffic?
+      a few megabytes (one block) every ten minutes
+   sadly, the maximum block size is limited to a few megabytes
 
 Q: could Bitcoin have been just a ledger w/o a new currency?
    e.g. have dollars be the currency?
    since the currency part is pretty awkward.
    (settlement... mining incentive...)
 
+weak points in the design?
+  too bad it's a new currency as well as a payment system
+  transaction confirmation takes at least 10 minutes, or 60 for high confidence
+  flooding limits performance, may be a point of attack
+  maximum block size plus 10 minutes limits max transactions per second
+  vulnerable to majority attack
+  proof-of-work wastes CPU time, power
+  not very anonmyous
+  too anonymous -- illegal uses may trigger legal response
+  users have trouble securing private keys
+
 key idea: block chain
-  public ledger is a great idea
+  public agreed-on ledger is a great idea
   decentralization might be good
-  mining is a clever way to avoid sybil attacks
-  tieing ledger to new currency seems awkward, maybe necessary
+  mining is a clever way to avoid sybil attacks in an open system,
+    and ensure most blocks are created by benign peers
 
-https://michaelnielsen.org/ddi/how-the-bitcoin-protocol-actually-works/
-
-Bitcoin FAQ
+6.824 Bitcoin FAQ
 
 Q: I don't understand why the blockchain is so important. Isn't the
 requirement for the owner's signature on each transaction enough to
@@ -287,7 +311,7 @@ publishing system to try to ensure that once a bitcoin has been spent
 once, lots of participants will know, and will be able to reject a
 second spend.
 
-Q: What does Bitcoin need to define a new currency? Wouldn't it be more
+Q: Why does Bitcoin need to define a new currency? Wouldn't it be more
 convenient to use an existing currency like dollars?
 
 A: The new currency (Bitcoins) allows the system to reward miners with
@@ -321,35 +345,36 @@ in Hyperledger.
 Q: Can Alice spend the same coin twice by sending "pay Bob" and "pay
 Charlie" to different subsets of miners?
 
-A: The most likely scenario is that one subset of miners finds the
-nonce for a new block first. Let's assume the first block to be found
-is B50 and it contains "pay Bob". This block will be flooded to all
-miners, so the miners working on "pay Charlie" will switch to mining a
-successor block to B50. These miners validate transactions they place
-in blocks, so they will notice that the "pay Charlie" coin was spent in
-B50, and they will ignore the "pay Charlie" transaction. Thus, in this
-scenario, double-spend won't work.
+A: Suppose Alice does that. One of the two subsets of miners is likely
+to find the nonce for a new block first. Let's assume the first block
+to be found is B50 and it contains "pay Bob". This block will be
+flooded to all miners, so the miners working on "pay Charlie" will
+switch to mining a successor block to B50. These miners validate
+transactions they place in blocks, so they will notice that the "pay
+Charlie" coin was spent in B50, and they will ignore the "pay Charlie"
+transaction. Thus, in this scenario, double-spend won't work.
 
 There's a small chance that two miners find blocks at the same time,
-perhaps B50' containing "pay Bob" and B50'' containing "pay Charlie". At
-this point there's a fork in the block chain. These two blocks will be
-flooded to all the nodes. Each node will start mining a successor to one
-of them (the first it hears). Again the most likely outcome is that a
-single miner will finish significantly before any other miner, and flood
-the successor, and most peers will switch that winning fork. The chance
-of repeatedly having two miners simultaneously find blocks gets very
-small as the forks get longer. So eventually all the peers will switch
-to the same fork, and in fork there will be only one spend of the coin.
+perhaps B50' containing "pay Bob" and B50'' containing "pay Charlie".
+At this point there's a fork in the block chain. These two blocks will
+be flooded to all the nodes. Each node will start mining a successor
+to one of them (the first it hears). Again the most likely outcome is
+that a single miner will finish significantly before any other miner,
+and flood the successor, and most peers will switch to that winning
+fork. The chance of repeatedly having two miners simultaneously find
+blocks gets very small as the forks get longer. So eventually all the
+peers will switch to the same fork, and in that fork there will be
+only one spend of the coin.
 
-The possibility of accidentally having a short-lived fork is the reason
-that careful clients will wait until there are a few successor blocks
-before believing a transaction.
+The possibility of accidentally having a short-lived fork is the
+reason that careful clients wait until there are a few successor
+blocks before believing a transaction.
 
 Q: It takes an average of 10 minutes for a Bitcoin block to be
 validated. Does this mean that the parties involved aren't sure if the
 transaction really happened until 10 minutes later?
 
-A: The 10 minutes is awkward. But it's not always a problem. For
+A: Yes. The 10 minutes is awkward. But it's not always a problem. For
 example, suppose you buy a toaster oven with Bitcoin from a web site.
 The web site can check that the transaction is known by a few servers,
 though not yet in a block, and show you a "purchase completed" page.
@@ -383,9 +408,10 @@ as the blockchain grows?
 A: It's true that it takes a while for a new node to get all the
 transactions. But once a given server has done this work, it can save
 the block chain, and doesn't need to fetch it again. It only needs to
-know about new blocks, which is not a huge burden. I think most
-ordinary users of Bitcoin won't run full Bitcoin nodes; instead they
-will one way or another trust some full nodes.
+know about new blocks, which is not a huge burden. On the other hand
+most ordinary users of Bitcoin don't run full Bitcoin nodes; instead
+they trust a few full nodes to answer questions about whether coins
+have already been spent.
 
 Q: Is it feasible for an attacker to gain a majority of the computing
 power among peers? What are the implications for bitcoin if this happens?
@@ -394,15 +420,15 @@ A: It may be feasible; some people think that big cooperative groups
 of miners have been close to a majority at times:
 http://www.coindesk.com/51-attacks-real-threat-bitcoin/
 
-If >50% of compute power are controlled by a single user (or by a clique
-of colluding users), they can extend the blockchain from any block they
-like, and can double-spend money. Hence, Bitcoin's security would be
-broken if this happened.
+If >50% of compute power is controlled by a single entity, they can
+double-spend bitcoins: transfer a coin to one payee, and then generate
+a new fork from before that transaction in which the transaction
+doesn't exist. Bitcoin's security would be broken if this happened.
 
 Q: From some news stories, I have heard that a large number of bitcoin
 miners are controlled by a small number of companies.
 
-A: This is true. See here: https://blockchain.info/pools. It looks like
+A: True. See here: https://blockchain.info/pools. It looks like
 three mining pools together hold >51% of the compute power today, and
 two come to 40%.
 
@@ -521,14 +547,12 @@ Q: What other kinds of virtual currency were there before and after
 Bitcoin (I know the paper mentioned hashcash)? What was different
 about Bitcoin that led it to have more success than its predecessors?
 
-A: There have been many proposals for digital cash systems, none with
-any noticeable success. And of course Bitcoin has inspired many
-competing and variant schemes, again none (as far as I can tell) with
-much success. It's tempting to think that Bitcoin has succeeded
-because its design is more clever than others: that it has just the
-right blend of incentives and decentralization and ease of use. But
-there are too many failed yet apparently well-designed technologies
-out there for me to believe that.
+A: There were many previous proposals for digital cash systems, none
+with any noticeable success. It's tempting to think that Bitcoin has
+succeeded because its design is more clever than others: that it has
+just the right blend of incentives and decentralization and ease of
+use. But there are too many failed yet apparently well-designed
+technologies out there for me to believe that.
 
 Q: What happens when more (or fewer) people mine Bitcoin?
 
@@ -610,4 +634,3 @@ to lose money. This kind of speculation happens with many goods;
 there's nothing special about Bitcoin in this respect. For example:
 
   https://en.wikipedia.org/wiki/Tulip_mania
-

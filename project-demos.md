@@ -1,5 +1,3 @@
-## LEC 22: Project demos
-
 Q: Why are we reading this paper?
 
 A: Because it is a fun, intriguing read.  This paper was "written" (see

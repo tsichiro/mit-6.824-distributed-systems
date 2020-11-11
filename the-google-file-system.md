@@ -1,304 +1,451 @@
-# The Google File System
+6.824 2020 Lecture 3: GFS
 
-[The Google File System](the-google-file-system.pdf)
-
+The Google File System
 Sanjay Ghemawat, Howard Gobioff, and Shun-Tak Leung
 SOSP 2003
 
-<!-- TOC -->
+Why are we reading this paper?
+  distributed storage is a key abstraction
+    what should the interface/semantics look like?
+    how should it work internally?
+  GFS paper touches on many themes of 6.824
+    parallel performance, fault tolerance, replication, consistency
+  good systems paper -- details from apps all the way to network
+  successful real-world design
 
-- [The Google File System](#the-google-file-system)
-  - [Why are we reading this paper?](#why-are-we-reading-this-paper)
-  - [What is consistency?](#what-is-consistency)
-  - ["Ideal" consistency model](#ideal-consistency-model)
-  - [Challenges to achieving ideal consistency](#challenges-to-achieving-ideal-consistency)
-  - [GFS goals:](#gfs-goals)
-  - [High-level design / Reads](#high-level-design--reads)
-    - [Writes](#writes)
-    - [Record append](#record-append)
-  - [Housekeeping](#housekeeping)
-  - [Failures](#failures)
-  - [Does GFS achieve "ideal" consistency?](#does-gfs-achieve-ideal-consistency)
-    - [Authors claims weak consistency is not a big problems for apps](#authors-claims-weak-consistency-is-not-a-big-problems-for-apps)
-  - [Performance (Figure 3)](#performance-figure-3)
-  - [Summary](#summary)
-  - [References](#references)
-  - [GFS FAQ](#gfs-faq)
+Why is distributed storage hard?
+  high performance -> shard data over many servers
+  many servers -> constant faults
+  fault tolerance -> replication
+  replication -> potential inconsistencies
+  better consistency -> low performance
 
-<!-- /TOC -->
-## Why are we reading this paper?
+What would we like for consistency?
+  Ideal model: same behavior as a single server
+  server uses disk storage
+  server executes client operations one at a time (even if concurrent)
+  reads reflect previous writes
+    even if server crashes and restarts
+  thus:
+    suppose C1 and C2 write concurrently, and after the writes have
+      completed, C3 and C4 read. what can they see?
+    C1: Wx1
+    C2: Wx2
+    C3:     Rx?
+    C4:         Rx?
+    answer: either 1 or 2, but both have to see the same value.
+  This is a "strong" consistency model.
+  But a single server has poor fault-tolerance.
 
-- the file system used for map/reduce
-- main themes of 6.824 show up in this paper
-  - trading consistency for simplicity and performance
-  - motivation for subsequent designs
-- good systems paper -- details from apps all the way to network
-  - performance, fault-tolerance, consistency
-- influential
-  - many other systems use GFS (e.g., Bigtable, Spanner @ Google)
-  - HDFS (Hadoop Distributed File System) based on GFS
+Replication for fault-tolerance makes strong consistency tricky.
+  a simple but broken replication scheme:
+    two replica servers, S1 and S2
+    clients send writes to both, in parallel
+    clients send reads to either
+  in our example, C1's and C2's write messages could arrive in
+    different orders at the two replicas
+    if C3 reads S1, it might see x=1
+    if C4 reads S2, it might see x=2
+  or what if S1 receives a write, but 
+    the client crashes before sending the write to S2?
+  that's not strong consistency!
+  better consistency usually requires communication to
+    ensure the replicas stay in sync -- can be slow!
+  lots of tradeoffs possible between performance and consistency
+    we'll see one today
 
-## What is consistency?
+GFS
 
-- A correctness condition
-- Important but difficult to achieve when data is replicated
-  - especially when application access it concurrently
-  - [diagram: simple example, single machine]
-  - if an application writes, what will a later read observe?
-    - what if the read is from a different application?
-  - but with replication, each write must also happen on other machines
-  - [diagram: two more machines, reads and writes go across]
-  - Clearly we have a problem here.
-- Weak consistency
-  - read() may return stale data --- not the result of the most recent write
-- Strong consistency
-  - read() always returns the data from the most recent write()
-- General tension between these:
-  - strong consistency is easy for application writers
-  - strong consistency is bad for performance
-  - weak consistency has good performance and is easy to scale to many servers
-  - weak consistency is complex to reason about
-- Many trade-offs give rise to different correctness conditions
-  - These are called "consistency models"
-  - First peek today; will show up in almost every paper we read this term
+Context:
+  Many Google services needed a big fast unified storage system
+    Mapreduce, crawler/indexer, log storage/analysis, Youtube (?)
+  Global (over a single data center): any client can read any file
+    Allows sharing of data among applications
+  Automatic "sharding" of each file over many servers/disks
+    For parallel performance
+    To increase space available
+  Automatic recovery from failures
+  Just one data center per deployment
+  Just Google applications/users
+  Aimed at sequential access to huge files; read or append
+    I.e. not a low-latency DB for small items
 
-## "Ideal" consistency model
+What was new about this in 2003? How did they get an SOSP paper accepted?
+  Not the basic ideas of distribution, sharding, fault-tolerance.
+  Huge scale.
+  Used in industry, real-world experience.
+  Successful use of weak consistency.
+  Successful use of single master.
 
-- Let's go back to the single-machine case
-- Would be nice if a replicated FS **behaved like a non-replicated file system**
-  - [diagram: many clients on the same machine accessing files on single disk]
-- If one application writes, later reads will observe that write
-- What if two application concurrently write to the same file?
-  - Q: what happens on a single machine?
-  - In file systems often undefined --- file may have some mixed content
-- What if two application concurrently write to the same directory
-  - Q: what happens on a single machine?
-  - One goes first, the other goes second (use locking)
+Overall structure
+  clients (library, RPC -- but not visible as a UNIX FS)
+  each file split into independent 64 MB chunks
+  chunk servers, each chunk replicated on 3
+  every file's chunks are spread over the chunk servers
+    for parallel read/write (e.g. MapReduce), and to allow huge files
+  single master (!), and master replicas
+  division of work: master deals w/ naming, chunkservers w/ data
 
-## Challenges to achieving ideal consistency
+Master state
+  in RAM (for speed, must be smallish):
+    file name -> array of chunk handles (nv)
+    chunk handle -> version # (nv)
+                    list of chunkservers (v)
+                    primary (v)
+                    lease time (v)
+  on disk:
+    log
+    checkpoint
 
-- Concurrency -- as we just saw; plus there are many disks in reality
-- Machine failures -- any operation can fail to complete
-- Network partitions -- may not be able to reach every machine/disk
-- Why are these challenges difficult to overcome?
-  - Requires communication between clients and servers
-    - May cost performance
-  - Protocols can become complex --- see next week
-    - Difficult to implement system correctly
-  - Many systems in 6.824 don't provide ideal
-    - GFS is one example
+Why a log? and checkpoint?
 
-## GFS goals:
+Why big chunks?
 
-- With so many machines, failures are common
-  - must tolerate
-  - assume a machine fails once per year
-  - w/ 1000 machines, ~3 will fail per day.
-- High-performance: many concurrent readers and writers
-  - Map/Reduce jobs read and store final result in GFS
-  - Note: *not* the temporary, intermediate files
-- Use network efficiently: save bandwidth
-- These challenges difficult combine with "ideal" consistency
+What are the steps when client C wants to read a file?
+  1. C sends filename and offset to master M (if not cached)
+  2. M finds chunk handle for that offset
+  3. M replies with list of chunkservers
+     only those with latest version
+  4. C caches handle + chunkserver list
+  5. C sends request to nearest chunkserver
+     chunk handle, offset
+  6. chunk server reads from chunk file on disk, returns
 
-## High-level design / Reads
+How does the master know what chunkservers have a given chunk?
 
-- [Figure 1 diagram, master + chunkservers]
-- Master stores directories, files, names, open/read/write
-  - But not POSIX
-- 100s of Linux chunk servers with disks
-  - store 64MB chunks (an ordinary Linux file for each chunk)
-  - each chunk replicated on three servers
-  - Q: Besides availability of data, what does 3x replication give us?
-    - load balancing for reads to hot files affinity
-  - Q: why not just store one copy of each file on a RAID'd disk?
-    - RAID isn't commodity
-    - Want fault-tolerance for whole machine; not just storage device
-  - Q: why are the chunks so big?
-    - amortizes overheads, reduces state size in the master
-- GFS master server knows directory hierarchy
-  - for directory, what files are in it
-  - for file, knows chunk servers for each 64 MB
-  - master keeps state in memory
-    - 64 bytes of metadata per each chunk
-  - master has private recoverable database for metadata
-    - operation log flushed to disk
-    - occasional asynchronous compression info checkpoint
-    - N.B.: != the application checkpointing in Â§2.7.2
-    - master can recovery quickly from power failure
-  - shadow masters that lag a little behind master
-    - can be promoted to master
-- Client read:
-  - send file name and chunk index to master
-  - master replies with set of servers that have that chunk
-    - response includes version # of chunk
-    - clients cache that information
-  - ask nearest chunk server
-    - checks version #
-    - if version # is wrong, re-contact master
+What are the steps when C wants to do a "record append"?
+  paper's Figure 2
+  1. C asks M about file's last chunk
+  2. if M sees chunk has no primary (or lease expired):
+     2a. if no chunkservers w/ latest version #, error
+     2b. pick primary P and secondaries from those w/ latest version #
+     2c. increment version #, write to log on disk
+     2d. tell P and secondaries who they are, and new version #
+     2e. replicas write new version # to disk
+  3. M tells C the primary and secondaries
+  4. C sends data to all (just temporary...), waits
+  5. C tells P to append
+  6. P checks that lease hasn't expired, and chunk has space
+  7. P picks an offset (at end of chunk)
+  8. P writes chunk file (a Linux file)
+  9. P tells each secondary the offset, tells to append to chunk file
+  10. P waits for all secondaries to reply, or timeout
+      secondary can reply "error" e.g. out of disk space
+  11. P tells C "ok" or "error"
+  12. C retries from start if error
 
-### Writes
+What consistency guarantees does GFS provide to clients?
+  Needs to be in a form that tells applications how to use GFS.
 
-- [Figure 2-style diagram with file offset sequence]
-- Random client write to existing file
-  - client asks master for chunk locations + primary
-  - master responds with chunk servers, version #, and who is primary
-    - primary has (or gets) 60s lease
-  - client computes chain of replicas based on network topology
-  - client sends data to first replica, which forwards to others
-    - pipelines network use, distributes load
-  - replicas ack data receipt
-  - client tells primary to write
-    - primary assign sequence number and writes
-    - then tells other replicas to write
-    - once all done, ack to client
-  - what if there's another concurrent client writing to the same place?
-    - client 2 get sequenced after client 1, overwrites data
-    - now client 2 writes again, this time gets sequenced first (C1 may be slow) writes, but then client 1 comes and overwrites
-    - => all replicas have same data (= consistent), but mix parts from C1/C2
-      - (= NOT defined)
-- Client append (not record append)
-  - same deal, but may put parts from C1 and C2 in any order
-  - consistent, but not defined
-  - or, if just one client writes, no problem -- both consistent and defined
+Here's a possibility:
 
-### Record append
+  If the primary tells a client that a record append succeeded, then
+  any reader that subsequently opens the file and scans it will see
+  the appended record somewhere.
 
-- Client record append
-  - client asks master for chunk locations
-  - client pushes data to replicas, but specifies no offset
-  - client contacts primary when data is on all chunk servers
-    - primary assigns sequence number
-    - primary checks if append fits into chunk
-      - if not, pad until chunk boundary
-    - primary picks offset for append
-    - primary applies change locally
-    - primary forwards request to replicas
-    - let's saw R3 fails mid-way through applying the write
-    - primary detects error, tells client to try again
-  - client retries after contacting master
-    - master has perhaps brought up R4 in the meantime (or R3 came back)
-    - one replica now has a gap in the byte sequence, so can't just append
-    - pad to next available offset across all replicas
-    - primary and secondaries apply writes
-    - primary responds to client after receiving acks from all replicas
+(But not that failed appends won't be visible, or that all readers
+ will see the same file content, or the same order of records.)
 
-## Housekeeping
+How can we think about how GFS fulfils this guarantee?
+  Look at its handling of various failures:
+    crash, crash+reboot, crash+replacement, message loss, partition.
+  Ask how GFS ensures critical properties.
 
-- Master can appoint new primary if master doesn't refresh lease
-- Master replicates chunks if number replicas drop below some number
-- Master rebalances replicas
+* What if an appending client fails at an awkward moment?
+  Is there an awkward moment?
 
-## Failures
+* What if the appending client has cached a stale (wrong) primary?
 
-- Chunk servers are easy to replace
-  - failure may cause some clients to retry (& duplicate records)
-- Master: down -> GFS is unavailable
-  - shadow master can serve read-only operations, which may return stale data
-  - Q: Why not write operations?
-  - split-brain syndrome (see next lecture)
+* What if the reading client has cached a stale secondary list?
 
-## Does GFS achieve "ideal" consistency?
+* Could a master crash+reboot cause it to forget about the file?
+  Or forget what chunkservers hold the relevant chunk?
 
-- Two cases: directories and files
-- Directories: yes, but...
-  - Yes: strong consistency (only one copy)
-  - But: master not always available & scalability limit
-- Files: not always
-  - Mutations with atomic appends
-  - record can be duplicated at two offsets
-  - while other replicas may have a hole at one offset
-  - Mutations without atomic append
-    - data of several clients maybe intermingled
-    - if you care, use atomic append or a temporary file and atomically rename
-- An "unlucky" client can read stale data for short period of time
-  - A failed mutation leaves chunks inconsistent
-    - The primary chunk server updated chunk
-    - But then failed and the replicas are out of date
-  - A client may read an not-up-to-date chunk
-  - When client refreshes lease it will learn about new version #
+* Two clients do record append at exactly the same time.
+  Will they overwrite each others' records?
 
-### Authors claims weak consistency is not a big problems for apps
+* Suppose one secondary never hears the append command from the primary.
+  What if reading client reads from that secondary?
 
-- Most file updates are append-only updates
-  - Application can use UID in append records to detect duplicates
-  - Application may just read less data (but not stale data)
-- Application can use temporary files and atomic rename
+* What if the primary crashes before sending append to all secondaries?
+  Could a secondary that *didn't* see the append be chosen as the new primary?
 
-## Performance (Figure 3)
+* Chunkserver S4 with an old stale copy of chunk is offline.
+  Primary and all live secondaries crash.
+  S4 comes back to life (before primary and secondaries).
+  Will master choose S4 (with stale chunk) as primary?
+  Better to have primary with stale data, or no replicas at all?
 
-- huge aggregate throughput for read (3 copies, striping)
-  - 125 MB/sec in aggregate
-  - Close to saturating network
-- writes to different files lower than possible maximum
-  - authors blame their network stack
-  - it causes delays in propagating chunks from one replica to next
-- concurrent appends to single file
-  - limited by the server that stores last chunk
-- numbers and specifics have changed a lot in 15 years!
+* What should a primary do if a secondary always fails writes?
+  e.g. dead, or out of disk space, or disk has broken.
+  Should the primary drop secondary from set of secondaries?
+    And then return success to client appends?
+  Or should the primary keep sending ops, and having them fail,
+    and thus fail every client write request?
 
-## Summary
+* What if primary S1 is alive and serving client requests,
+    but network between master and S1 fails?
+  "network partition"
+  Will the master pick a new primary?
+  Will there now be two primaries?
+  So that the append goes to one primary, and the read to the other?
+    Thus breaking the consistency guarantee?
+    "split brain"
 
-- case study of performance, fault-tolerance, consistency
-  - specialized for MapReduce applications
-- what works well in GFS?
-  - huge sequential reads and writes
-  - appends
-  - huge throughput (3 copies, striping)
-  - fault tolerance of data (3 copies)
-- what less well in GFS?
-  - fault-tolerance of master
-  - small files (master a bottleneck)
-  - clients may see stale data
-  - appends maybe duplicated
+* If there's a partitioned primary serving client appends, and its
+  lease expires, and the master picks a new primary, will the new
+  primary have the latest data as updated by partitioned primary?
 
-## References
+* What if the master fails altogether.
+  Will the replacement know everything the dead master knew?
+  E.g. each chunk's version number? primary? lease expiry time?
 
-- [(discussion of gfs evolution)](http://queue.acm.org/detail.cfm?id=1594206)
-- [Google's Colossus Makes Search Real-Time By Dumping MapReduce](http://highscalability.com/blog/2010/9/11/googles-colossus-makes-search-real-time-by-dumping-mapreduce.html)
+* Who/what decides the master is dead, and must be replaced?
+  Could the master replicas ping the master, take over if no response?
 
-## GFS FAQ
+* What happens if the entire building suffers a power failure?
+  And then power is restored, and all servers reboot.
 
-Q: Why is atomic record append at-least-once, rather than exactly once?
+* Suppose the master wants to create a new chunk replica.
+  Maybe because too few replicas.
+  Suppose it's the last chunk in the file, and being appended to.
+  How does the new replica ensure it doesn't miss any appends?
+    After all it is not yet one of the secondaries.
 
-It is difficult to make the append exactly once, because a primary would then need to keep state to perform duplicate detection. That state must be replicated across servers so that if the primary fails, this information isn't lost. You will implement exactly once in lab 3, but with more complicated protocols that GFS uses.
+* Is there *any* circumstance in which GFS will break the guarantee?
+  i.e. append succeeds, but subsequent readers don't see the record.
+  All master replicas permanently lose state (permanent disk failure).
+    Could be worse: result will be "no answer", not "incorrect data".
+    "fail-stop"
+  All chunkservers holding the chunk permanently lose disk content.
+    again, fail-stop; not the worse possible outcome
+  CPU, RAM, network, or disk yields an incorrect value.
+    checksum catches some cases, but not all
+  Time is not properly synchronized, so leases don't work out.
+    So multiple primaries, maybe write goes to one, read to the other.
 
-Q: How does an application know what sections of a chunk consist of padding and duplicate records?
+What application-visible anomalous behavior does GFS allow?
+  Will all clients see the same file content?
+    Could one client see a record that another client doesn't see at all?
+    Will a client see the same content if it reads a file twice?
+  Will all clients see successfully appended records in the same order?
 
-A: To detect padding, applications can put a predictable magic number at the start of a valid record, or include a checksum that will likely only be valid if the record is valid. The application can detect duplicates by including unique IDs in records. Then, if it reads a record that has the same ID as an earlier record, it knows that they are duplicates of each other. GFS provides a library for applications that handles these cases.
+Will these anomalies cause trouble for applications?
+  How about MapReduce?
 
-Q: How can clients find their data given that atomic record append writes it at an unpredictable offset in the file?
+What would it take to have no anomalies -- strict consistency?
+  I.e. all clients see the same file content.
+  Too hard to give a real answer, but here are some issues.
+  * Primary should detect duplicate client write requests.
+    Or client should not issue them.
+  * All secondaries should complete each write, or none.
+    Perhaps tentative writes until all promise to complete it?
+    Don't expose writes until all have agreed to perform them!
+  * If primary crashes, some replicas may be missing the last few ops.
+    New primary must talk to all replicas to find all recent ops,
+    and sync with secondaries.
+  * To avoid client reading from stale ex-secondary, either all client
+    reads must go to primary, or secondaries must also have leases.
+  You'll see all this in Labs 2 and 3!
 
-A: Append (and GFS in general) is mostly intended for applications that read entire files. Such applications will look for every record (see the previous question), so they don't need to know the record locations in advance. For example, the file might contain the set of link URLs encountered by a set of concurrent web crawlers. The file offset of any given URL doesn't matter much; readers just want to be able to read the entire set of URLs.
+Performance (Figure 3)
+  large aggregate throughput for read (3 copies, striping)
+    94 MB/sec total for 16 chunkservers
+      or 6 MB/second per chunkserver
+      is that good?
+      one disk sequential throughput was about 30 MB/s
+      one NIC was about 10 MB/s
+    Close to saturating network (inter-switch link)
+    So: individual server performance is low
+        but scalability is good
+        which is more important?
+    Table 3 reports 500 MB/sec for production GFS, which is a lot
+  writes to different files lower than possible maximum
+    authors blame their network stack (but no detail)
+  concurrent appends to single file
+    limited by the server that stores last chunk
+  hard to interpret after 15 years, e.g. how fast were the disks?
+
+Random issues worth considering
+  What would it take to support small files well?
+  What would it take to support billions of files?
+  Could GFS be used as wide-area file system?
+    With replicas in different cities?
+    All replicas in one datacenter is not very fault tolerant!
+  How long does GFS take to recover from a failure?
+    Of a primary/secondary?
+    Of the master?
+  How well does GFS cope with slow chunkservers?
+
+Retrospective interview with GFS engineer:
+  http://queue.acm.org/detail.cfm?id=1594206
+  file count was the biggest problem
+    eventual numbers grew to 1000x those in Table 2 !
+    hard to fit in master RAM
+    master scanning of all files/chunks for GC is slow
+  1000s of clients too much CPU load on master
+  applications had to be designed to cope with GFS semantics
+    and limitations
+  master fail-over initially entirely manual, 10s of minutes
+  BigTable is one answer to many-small-files problem
+  and Colossus apparently shards master data over many masters
+
+Summary
+  case study of performance, fault-tolerance, consistency
+    specialized for MapReduce applications
+  good ideas:
+    global cluster file system as universal infrastructure
+    separation of naming (master) from storage (chunkserver)
+    sharding for parallel throughput
+    huge files/chunks to reduce overheads
+    primary to sequence writes
+    leases to prevent split-brain chunkserver primaries
+  not so great:
+    single master performance
+      ran out of RAM and CPU
+    chunkservers not very efficient for small files
+    lack of automatic fail-over to master replica
+    maybe consistency was too relaxed
+
+GFS FAQ
+
+Q: Why is atomic record append at-least-once, rather than exactly
+once?
+
+Section 3.1, Step 7, says that if a write fails at one of the
+secondaries, the client re-tries the write. That will cause the data
+to be appended more than once at the non-failed replicas. A different
+design could probably detect duplicate client requests despite
+arbitrary failures (e.g. a primary failure between the original
+request and the client's retry). You'll implement such a design in Lab
+3, at considerable expense in complexity and performance.
+
+Q: How does an application know what sections of a chunk consist of
+padding and duplicate records?
+
+A: To detect padding, applications can put a predictable magic number
+at the start of a valid record, or include a checksum that will likely
+only be valid if the record is valid. The application can detect
+duplicates by including unique IDs in records. Then, if it reads a
+record that has the same ID as an earlier record, it knows that they
+are duplicates of each other. GFS provides a library for applications
+that handles these cases.
+
+Q: How can clients find their data given that atomic record append
+writes it at an unpredictable offset in the file?
+
+A: Append (and GFS in general) is mostly intended for applications
+that sequentially read entire files. Such applications will scan the
+file looking for valid records (see the previous question), so they
+don't need to know the record locations in advance. For example, the
+file might contain the set of link URLs encountered by a set of
+concurrent web crawlers. The file offset of any given URL doesn't
+matter much; readers just want to be able to read the entire set of
+URLs.
+
+Q: What's a checksum?
+
+A: A checksum algorithm takes a block of bytes as input and returns a
+single number that's a function of all the input bytes. For example, a
+simple checksum might be the sum of all the bytes in the input (mod
+some big number). GFS stores the checksum of each chunk as well as the
+chunk. When a chunkserver writes a chunk on its disk, it first
+computes the checksum of the new chunk, and saves the checksum on disk
+as well as the chunk. When a chunkserver reads a chunk from disk, it
+also reads the previously-saved checksum, re-computes a checksum from
+the chunk read from disk, and checks that the two checksums match. If
+the data was corrupted by the disk, the checksums won't match, and the
+chunkserver will know to return an error. Separately, some GFS
+applications stored their own checksums, over application-defined
+records, inside GFS files, to distinguish between correct records and
+padding. CRC32 is an example of a checksum algorithm.
 
 Q: The paper mentions reference counts -- what are they?
 
 A: They are part of the implementation of copy-on-write for snapshots.
-When GFS creates a snapshot, it doesn't copy the chunks, but instead increases the reference counter of each chunk. This makes creating a snapshot inexpensive. If a client writes a chunk and the master notices the reference count is greater than one, the master first
-makes a copy so that the client can update the copy (instead of the chunk that is part of the snapshot). You can view this as delaying the copy until it is absolutely necessary. The hope is that not all chunks will be modified and one can avoid making some copies.
+When GFS creates a snapshot, it doesn't copy the chunks, but instead
+increases the reference counter of each chunk. This makes creating a
+snapshot inexpensive. If a client writes a chunk and the master
+notices the reference count is greater than one, the master first
+makes a copy so that the client can update the copy (instead of the
+chunk that is part of the snapshot). You can view this as delaying the
+copy until it is absolutely necessary. The hope is that not all chunks
+will be modified and one can avoid making some copies.
 
-Q: If an application uses the standard POSIX file APIs, would it need to be modified in order to use GFS?
+Q: If an application uses the standard POSIX file APIs, would it need
+to be modified in order to use GFS?
 
-A: Yes, but GFS isn't intended for existing applications. It is designed for newly-written applications, such as MapReduce programs.
+A: Yes, but GFS isn't intended for existing applications. It is
+designed for newly-written applications, such as MapReduce programs.
 
 Q: How does GFS determine the location of the nearest replica?
 
-A: The paper hints that GFS does this based on the IP addresses of the servers storing the available replicas. In 2003, Google must have assigned IP addresses in such a way that if two IP addresses are close to each other in IP address space, then they are also close together in the machine room.
+A: The paper hints that GFS does this based on the IP addresses of the
+servers storing the available replicas. In 2003, Google must have
+assigned IP addresses in such a way that if two IP addresses are close
+to each other in IP address space, then they are also close together
+in the machine room.
+
+Q: Suppose S1 is the primary for a chunk, and the network between the
+master and S1 fails. The master will notice and designate some other
+server as primary, say S2. Since S1 didn't actually fail, are there
+now two primaries for the same chunk?
+
+A: That would be a disaster, since both primaries might apply
+different updates to the same chunk. Luckily GFS's lease mechanism
+prevents this scenario. The master granted S1 a 60-second lease to be
+primary. S1 knows to stop being primary when its lease expires. The
+master won't grant a lease to S2 until the previous lease to S1
+expires. So S2 won't start acting as primary until after S1 stops.
+
+Q: 64 megabytes sounds awkwardly large for the chunk size!
+
+A: The 64 MB chunk size is the unit of book-keeping in the master, and
+the granularity at which files are sharded over chunkservers. Clients
+could issue smaller reads and writes -- they were not forced to deal
+in whole 64 MB chunks. The point of using such a big chunk size is to
+reduce the size of the meta-data tables in the master, and to avoid
+limiting clients that want to do huge transfers to reduce overhead. On
+the other hand, files less than 64 MB in size do not get much
+parallelism.
 
 Q: Does Google still use GFS?
 
-A: GFS is still in use by Google and is the backend of other storage systems such as BigTable. GFS's design has doubtless been adjusted over the years since workloads have become larger and technology has changed, but I don't know the details. HDFS is a public-domain clone of GFS's design, which is used by many companies.
+A: Rumor has it that GFS has been replaced by something called
+Colossus, with the same overall goals, but improvements in master
+performance and fault-tolerance.
 
-Q: Won't the master be a performance bottleneck?
+Q: How acceptable is it that GFS trades correctness for performance
+and simplicity?
 
-A: It certainly has that potential, and the GFS designers took trouble to avoid this problem. For example, the master keeps its state in memory so that it can respond quickly. The evaluation indicates that for large file/reads (the workload GFS is targeting), the master is not a bottleneck. For small file operations or directory operations, the master can keep up (see 6.2.4).
-
-Q: How acceptable is it that GFS trades correctness for performance and simplicity?
-
-A: This a recurring theme in distributed systems. Strong consistency usually requires protocols that are complex and require chit-chat between machines (as we will see in the next few lectures). By exploiting ways that specific application classes can tolerate relaxed
-consistency, one can design systems that have good performance and sufficient consistency. For example, GFS optimizes for MapReduce applications, which need high read performance for large files and are OK with having holes in files, records showing up several times, and
-inconsistent reads. On the other hand, GFS would not be good for storing account balances at a bank.
+A: This a recurring theme in distributed systems. Strong consistency
+usually requires protocols that are complex and require chit-chat
+between machines (as we will see in the next few lectures). By
+exploiting ways that specific application classes can tolerate relaxed
+consistency, one can design systems that have good performance and
+sufficient consistency. For example, GFS optimizes for MapReduce
+applications, which need high read performance for large files and are
+OK with having holes in files, records showing up several times, and
+inconsistent reads. On the other hand, GFS would not be good for
+storing account balances at a bank.
 
 Q: What if the master fails?
 
-A: There are replica masters with a full copy of the master state; an unspecified mechanism switches to one of the replicas if the current master fails (Section 5.1.3). It's possible a human has to intervene to designate the new master. At any rate, there is almost certainly a
-single point of failure lurking here that would in theory prevent automatic recovery from master failure. We will see in later lectures how you could make a fault-tolerant master using Raft.
+A: There are replica masters with a full copy of the master state; the
+paper's design requires human intervention to switch to one of the
+replicas after a master failure (Section 5.1.3). We will see later how
+to build replicated services with automatic cut-over to a backup,
+using Raft.
+
+Q: Did having a single master turn out to be a good idea?
+
+A: That idea simplified initial deployment but was not so great in the
+long run. This article -- https://queue.acm.org/detail.cfm?id=1594206
+-- says that as the years went by and GFS use grew, a few things went
+wrong. The number of files grew enough that it wasn't reasonable to
+store all files' metadata in the RAM of a single master. The number of
+clients grew enough that a single master didn't have enough CPU power
+to serve them. The fact that switching from a failed master to one of
+its backups required human intervention made recovery slow. Apparently
+Google's replacement for GFS, Colossus, splits the master over
+multiple servers, and has more automated master failure recovery.

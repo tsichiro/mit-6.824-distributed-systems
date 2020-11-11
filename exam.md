@@ -1,5 +1,3 @@
-## Exam
-
 6.824 2020 Midterm Exam
 
 *** MapReduce (1)

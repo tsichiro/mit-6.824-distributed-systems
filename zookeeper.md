@@ -1,355 +1,319 @@
-# Zookeeper
+6.824 2020 Lecture 8: Zookeeper Case Study
 
-[ZooKeeper: wait-free coordination for internet-scale systems](./zookeeper-wait-free-coordination-for-internet-scale-systems.pdf)
-Patrick Hunt, Mahadev Konar, Flavio P. Junqueira, Benjamin Reed.
-Proceedings of the 2010 USENIX Annual Technical Conference.
+Reading: "ZooKeeper: wait-free coordination for internet-scale systems", Patrick
+Hunt, Mahadev Konar, Flavio P. Junqueira, Benjamin Reed.  Proceedings of the 2010
+USENIX Annual Technical Conference.
 
-Why are we reading this paper?
-  Widely-used replicated state machine service
-    Inspired by Chubby (Google's global lock service)
-    Originally at Yahoo!, now outside too (Mesos, HBase, etc.)
-  Open source
-    As Apache project (http://zookeeper.apache.org/)
-  Case study of building replicated services, given a Paxos/ZAB/Raft library
-    Similar issues show up in lab 3
-  API supports a wide-range of use cases
-    Application that need a fault-tolerant "master" don't need to roll their own
-    Zookeeper is generic enough that they should be able to use Zookeeper
-  High performance
-    Unlike lab 3's replicate key/value service
+What questions does this paper shed light on?
+  * Can we have coordination as a stand-alone general-purpose service?
+    What should the API look like?
+    How can other distributed applications use it?
+  * We paid lots of money for Nx replica servers.
+    Can we get Nx performance from them?
 
-Motivation: many applications in datacenter cluster need to coordinate
-  Example: GFS
-    master has list of chunk servers for each chunk
-    master decides which chunk server is primary
-    etc.
-  Other examples: YMB, Crawler, etc.
-    YMB needs master to shard topics
-    Crawler needs master that commands page fetching
-      (e.g., a bit like the master in mapreduce)
-  Applications also need to find each other
-    MapReduce needs to know IP:PORT of GFS master
-    Load balancer needs to know where web servers are
-  Coordination service typically used for this purpose
+First, performance.
+  For now, view ZooKeeper as some service replicated with a Raft-like scheme.
+  Much like Lab 3.
+  [clients, leader/state/log, followers/state/log]
 
-Motivation: performance -- lab3
-  dominated by Raft
-  consider a 3-node Raft
-  before returning to client, Raft performs
-    leader persists log entry
-    in parallel, leader send message to followers
-      each follower persist log entry
-      each follower responds
-  -> 2 disk writes and one round trip
-    if magnetic disk: 2*10msec = 50 msg/sec
-    if SSD: 2*2msec+1msec = 200 msg/sec
-  Zookeeper performs 21,000 msg/sec
-    asynchronous calls
-    allows pipelining
+Does this replication arrangement get faster as we add more servers?
+  Assume a busy system, lots of active clients.
+  Writes probably get slower with more replicas!
+    Since leader must send each write to growing # of followers.
+  What about reads?
 
-Alternative plan: develop fault-tolerant master for each application
-  announce location via DNS
-  OK, if writing master isn't complicated
-  But, master often needs to be:
-    fault tolerant
-      every application figures how to use Raft?
-    high performance
-      every application figures how to make "read" operations fast?
-  DNS propagation is slow
-    fail-over will take a long time!
-  Some application settle for single-point of failure
-    E.g., GFS and MapReduce
-    Less desirable
+Q: Can replicas serve read-only client requests form their local state?
+   Without involving the leader or other replicas?
+   Then total read capacity would be O(# servers), not O(1)!
 
-Zookeeper: a generic coordination service
-  Design challenges:
-    What API?
-    How to make master fault tolerant?
-    How to get good performance?
-  Challenges interact
-    good performance may influence API
-    e.g., asynchronous interface to allow pipelining
+Q: Would reads from followers be linearizable?
+   Would reads always yield fresh data?
+   No:
+     Replica may not be in majority, so may not have seen a completed write.
+     Replica may not yet have seen a commit for a completed write.
+     Replica may be entirely cut off from the leader (same as above).
+   Linearizability forbids stale reads!
 
-Zookeeper API overview
-  [diagram: ZooKeeper, client sessions, ZAB layer]
-  replicated state machine
-    several servers implementing the service
-    operations are performed in global order
-      with some exceptions, if consistency isn't important
-  the replicated objects are: znodes
-    hierarchy of znodes
-      named by pathnames
-    znodes contain *metadata* of application
-      configuration information
-        machines that participate in the application
-        which machine is the primary
-      timestamps
-      version number
-    types of znodes:
-      regular
-      empheral
-      sequential: name + seqno
-        If n is the new znode and p is the parent znode, then the sequence
-        value of n is never smaller than the value in the name of any other
-        sequential znode ever created under p.
+Q: What if a client reads from an up-to-date replica, then a lagging replica?
+   It may see data values go *backwards* in time! Also forbidden.
 
-  sessions
-    clients sign into zookeeper
-    session allows a client to fail-over to another Zookeeper service
-      client know the term and index of last completed operation (zxid)
-      send it on each request
-        service performs operation only if caught up with what client has seen
-    sessions can timeout
-      client must refresh a session continuously
-        send a heartbeat to the server (like a lease)
-      ZooKeeper considers client "dead" if doesn't hear from a client
-      client may keep doing its thing (e.g., network partition)
-        but cannot perform other ZooKeeper ops in that session
-    no analogue to this in Raft + Lab 3 KV store
+Raft and Lab 3 avoid these problems.
+  Clients have to send reads to the leader.
+  So Lab 3 reads are linearizable.
+  But no opportunity to divide the read load over the followers.
+  
+How does ZooKeeper skin this cat?
+  By changing the definition of correctness!
+  It allows reads to yield stale data.
+  But otherwise preserves order.
 
-Operations on znodes
+Ordering guarantees (Section 2.3)
+  * Linearizable writes
+    clients send writes to the leader
+    the leader chooses an order, numbered by "zxid"
+    sends to replicas, which all execute in zxid order
+    this is just like the labs
+  * FIFO client order
+    each client specifies an order for its operations (reads AND writes)
+    writes:
+      writes appear in the write order in client-specified order
+      this is the business about the "ready" file in 2.3
+    reads:
+      each read executes at a particular point in the write order
+      a client's successive reads execute at non-decreasing points in the order
+      a client's read executes after all previous writes by that client
+        a server may block a client's read to wait for previous write, or sync()
+
+Why does this make sense?
+  I.e. why OK for reads to return stale data?
+       why OK for client 1 to see new data, then client 2 sees older data?
+
+At a high level:
+  not as painful for programmers as it may seem
+  very helpful for read performance!
+
+Why is ZooKeeper useful despite loose consistency?
+  sync() causes subsequent client reads to see preceding writes.
+    useful when a read must see latest data
+  Writes are well-behaved, e.g. exclusive test-and-set operations
+    writes really do execute in order, on latest data.
+  Read order rules ensure "read your own writes".
+  Read order rules help reasoning.
+    e.g. if read sees "ready" file, subsequent reads see previous writes.
+         (Section 2.3)
+         Write order:      Read order:
+         delete("ready")
+         write f1
+         write f2
+         create("ready")
+                           exists("ready")
+                           read f1
+                           read f2
+         even if client switches servers!
+    e.g. watch triggered by a write delivered before reads from subsequent writes.
+         Write order:      Read order:
+                           exists("ready", watch=true)
+                           read f1
+         delete("ready")
+         write f1
+         write f2
+                           read f2
+
+A few consequences:
+  Leader must preserve client write order across leader failure.
+  Replicas must enforce "a client's reads never go backwards in zxid order"
+    despite replica failure.
+  Client must track highest zxid it has read
+    to help ensure next read doesn't go backwards
+    even if sent to a different replica
+
+Other performance tricks in ZooKeeper:
+  Clients can send async writes to leader (async = don't have to wait).
+  Leader batches up many requests to reduce net and disk-write overhead.
+    Assumes lots of active clients.
+  Fuzzy snapshots (and idempotent updates) so snapshot doesn't stop writes.
+
+Is the resulting performance good?
+  Table 1
+  High read throughput -- and goes up with number of servers!
+  Lower write throughput -- and goes down with number of servers!
+  21,000 writes/second is pretty good!
+    Maybe limited by time to persist log to hard drives.
+    But still MUCH higher than 10 milliseconds per disk write -- batching.
+
+The other big ZooKeeper topic: a general-purpose coordination service.
+  This is about the API and how it can help distributed s/w coordinate.
+  It is not clear what such an API should look like!
+
+What do we mean by coordination as a service?
+  Example: VMware-FT's test-and-set server
+    If one replica can't talk to the other, grabs t-a-s lock, becomes sole server
+    Must be exclusive to avoid two primaries (e.g. if network partition)
+    Must be fault-tolerant
+  Example: GFS (more speculative)
+    Perhaps agreement on which meta-data replica should be master
+    Perhaps recording list of chunk servers, which chunks, who is primary
+  Other examples: MapReduce, YMB, Crawler, etc.
+    Who is the master; lists of workers; division of labor; status of tasks
+  A general-purpose service would save much effort!
+
+Could we use a Lab 3 key/value store as a generic coordination service?
+  For example, to choose new GFS master if multiple replicas want to take over?
+  perhaps
+    Put("master", my IP address)
+    if Get("master") == my IP address:
+      act as master
+  problem: a racing Put() may execute after the Get()
+    2nd Put() overwrites first, so two masters, oops
+    Put() and Get() are not a good API for mutual exclusion!
+  problem: what to do if master fails?
+    perhaps master repeatedly Put()s a fresh timestamp?
+    lots of polling...
+  problem: clients need to know when master changes
+    periodic Get()s?
+    lots of polling...
+
+Zookeeper API overview (Figure 1)
+  the state: a file-system-like tree of znodes
+  file names, file content, directories, path names
+  typical use: configuration info in znodes
+    set of machines that participate in the application
+    which machine is the primary
+  each znode has a version number
+  types of znodes:
+    regular
+    ephemeral
+    sequential: name + seqno
+
+Operations on znodes (Section 2.2)
   create(path, data, flags)
+    exclusive -- only first create indicates success
   delete(path, version)
-      if znode.version = version, then delete
+    if znode.version = version, then delete
   exists(path, watch)
+    watch=true means also send notification if path is later created/deleted
   getData(path, watch)
   setData(path, data, version)
     if znode.version = version, then update
   getChildren(path, watch)
   sync()
-   above operations are *asynchronous*
-   all operations are FIFO-ordered per client
-   sync waits until all preceding operations have been "propagated"
+    sync then read ensures writes before sync are visible to same client's read
+    client could instead submit a write
 
-Check: can we just do this with lab 3's KV service?
-  flawed plan: GFS master on startup does Put("gfs-master", my-ip:port)
-    other applications + GFS nodes do Get("gfs-master")
-  problem: what if two master candidates' Put()s race?
-    later Put() wins
-    each presumed master needs to read the key to see if it actually is the master
-      when are we assured that no delayed Put() thrashes us?
-      every other client must have seen our Put() -- hard to guarantee
-  problem: when master fails, who decides to remove/update the KV store entry?
-    need some kind of timeout
-    so master must store tuple of (my-ip:port, timestamp)
-      and continuously Put() to refresh the timestamp
-      others poll the entry to see if the timestamp stops changing
-  lots of polling + unclear race behavior -- complex
-  ZooKeeper API has a better story: watches, sessions, atomic znode creation
-    + only one creation can succeed -- no Put() race
-    + sessions make timeouts easy -- no need to store and refresh explicit timestamps
-    + watches are lazy notifications -- avoids commiting lots of polling reads
+ZooKeeper API well tuned to synchronization:
+  + exclusive file creation; exactly one concurrent create returns success
+  + getData()/setData(x, version) supports mini-transactions
+  + sessions automate actions when clients fail (e.g. release lock on failure)
+  + sequential files create order among multiple clients
+  + watches -- avoid polling
 
-Ordering guarantees
-  all write operations are totally ordered
-    if a write is performed by ZooKeeper, later writes from other clients see it
-    e.g., two clients create a znode, ZooKeeper performs them in some total order
-  all operations are FIFO-ordered per client
-  implications:
-    a read observes the result of an earlier write from the same client
-    a read observes some prefix of the writes, perhaps not including most recent write
-      -> read can return stale data
-    if a read observes some prefix of writes, a later read observes that prefix too
+Example: add one to a number stored in a ZooKeeper znode
+  what if the read returns stale data?
+    write will write the wrong value!
+  what if another client concurrently updates?
+    will one of the increments be lost?
+  while true:
+    x, v := getData("f")
+    if setData(x + 1, version=v):
+      break
+  this is a "mini-transaction"
+    effect is atomic read-modify-write
+  lots of variants, e.g. test-and-set for VMware-FT
 
-Example "ready" znode:
-  A failure happens
-  A primary sends a stream of writes into Zookeeper
-    W1...Wn C(ready)
-  The final write updates ready znode
-    -> all preceding writes are visible
-  The final write causes the watch to go off at backup
-    backup issues R(ready) R1...Rn
-    however, it will observe all writes because zookeeper will delay read until
-      node has seen all txn that watch observed
-  Lets say failure happens during R1 .. Rn, say after return Rj to client
-    primary deletes ready file -> watch goes off
-    watch alert is sent to client
-    client knows it must issue new R(ready) R1 ...Rn
-  Nice property: high performance
-    pipeline writes and reads
-    can read from *any* zookeeper node
+Example: Simple Locks (Section 2.4)
+  acquire():
+    while true:
+      if create("lf", ephemeral=true), success
+      if exists("lf", watch=true)
+        wait for notification
 
-Example usage 1: slow lock
-  acquire lock:
-   retry:
-     r = create("app/lock", "", empheral)
-     if r:
-       return
-     else:
-       getData("app/lock", watch=True)
+  release(): (voluntarily or session timeout)
+    delete("lf")
 
-    watch_event:
-       goto retry
+  Q: what if lock released just as loser calls exists()?
 
-  release lock: (voluntarily or session timeout)
-    delete("app/lock")
+Example: Locks without Herd Effect
+  (look at pseudo-code in paper, Section 2.4, page 6)
+  1. create a "sequential" file
+  2. list files
+  3. if no lower-numbered, lock is acquired!
+  4. if exists(next-lower-numbered, watch=true)
+  5.   wait for event...
+  6. goto 2
 
-Example usage 2: "ticket" locks
-  acquire lock:
-     n = create("app/lock/request-", "", empheral|sequential)
-   retry:
-     requests = getChildren(l, false)
-     if n is lowest znode in requests:
-       return
-     p = "request-%d" % n - 1
-     if exists(p, watch = True)
-       goto retry
-
-    watch_event:
-       goto retry
-
-  Q: can watch_even fire before lock it is the client's turn
+  Q: could a lower-numbered file be created between steps 2 and 3?
+  Q: can watch fire before it is the client's turn?
   A: yes
-     lock/request-10 <- current lock holder
-     lock/request-11 <- next one
-     lock/request-12 <- my request
+     lock-10 <- current lock holder
+     lock-11 <- next one
+     lock-12 <- my request
 
-     if client associated with request-11 dies before it gets the lock, the
-     watch even will fire but it isn't my turn yet.
+     if client that created lock-11 dies before it gets the lock, the
+     watch will fire but it isn't my turn yet.
 
-Using locks
-  Not straight forward: a failure may cause your lock to be revoked
-    client 1 acquires lock
-      starts doing its stuff
-      network partitions
-      zookeeper declares client 1 dead (but it isn't)
-    client 2 acquires lock, but client 1 still believes it has it
-      can be avoided by setting timeouts correctly
-      need to disconnect client 1 session before ephemeral nodes go away
-      requires session heartbeats to be replicated to majority
-        N.B.: paper doesn't discuss this
-  For some cases, locks are a performance optimization
-    for example, client 1 has a lock on crawling some urls
-    client will do it 2 now, but that is fine
-  For other cases, locks are a building block
-    for example, application uses it to build transaction
-    the transactions are all-or-nothing
-    we will see an example in the Frangipani paper
+Using these locks
+  Different from single-machine thread locks!
+    If lock holder fails, system automatically releases locks.
+    So locks are not really enforcing atomicity of other activities.
+    To make writes atomic, use "ready" trick or mini-transactions.
+  Useful for master/leader election.
+    New leader must inspect state and clean up.
+  Or soft locks, for performance but not correctness
+    e.g. only one worker does each Map or Reduce task (but OK if done twice)
+    e.g. a URL crawled by only one worker (but OK if done twice)
 
-Zookeeper simplifies building applications but is not an end-to-end solution
-  Plenty of hard problems left for application to deal with
-  Consider using Zookeeper in GFS
-    I.e., replace master with Zookeeper
-  Application/GFS still needs all the other parts of GFS
-    the primary/backup plan for chunks
-    version numbers on chunks
-    protocol for handling primary fail over
-    etc.
-  With Zookeeper, at least master is fault tolerant
-    And, won't run into split-brain problem
-    Even though it has replicated servers
-
-Implementation overview
-  Similar to lab 3 (see last lecture)
-  two layers:
-    ZooKeeper services  (K/V service)
-    ZAB layer (Raft layer)
-  Start() to insert ops in bottom layer
-  Some time later ops pop out of bottom layer on each replica
-    These ops are committed in the order they pop out
-    on apply channel in lab 3
-    the abdeliver() upcall in ZAB
-
-Challenge: Duplicates client requests
-  Scenario
-    Primary receives client request, fails
-    Client resends client request to new primary
-  Lab 3:
-    Table to detect duplicates
-    Limitation: one outstanding op per client
-    Problem problem: cannot pipeline client requests
-  Zookeeper:
-    Some ops are idempotent period
-    Some ops are easy to make idempotent
-      test-version-and-then-do-op
-      e.g., include timestamp and version in setDataTXN
-
-Challenge: Read operations
-  Many operations are read operations
-    they don't modify replicated state
-  Must they go through ZAB/Raft or not?
-  Can any replica execute the read op?
-  Performance is slow if read ops go through Raft
-
-Problem: read may return stale data if only master performs it
-  The primary may not know that it isn't the primary anymore
-    a network partition causes another node to become primary
-    that partition may have processed write operations
-  If the old primary serves read operations, it won't have seen those write ops
-   => read returns stale data
-
-Zookeeper solution: don't promise non-stale data (by default)
-  Reads are allowed to return stale data
-    Reads can be executed by any replica
-    Read throughput increases as number of servers increases
-    Read returns the last zxid it has seen
-     So that new primary can catch up to zxid before serving the read
-     Avoids reading from past
-  Only sync-read() guarantees data is not stale
-
-Sync optimization: avoid ZAB layer for sync-read
-  must ensure that read observes last committed txn
-  leader puts sync in queue between it and replica
-    if ops ahead of in the queue commit, then leader must be leader
-    otherwise, issue null transaction
-  in same spirit read optimization in Raft paper
-    see last par section 8 of raft paper
-
-Performance (see table 1)
-  Reads inexpensive
-    Q: Why more reads as servers increase?
-  Writes expensive
-    Q: Why slower with increasing number of servers?
-  Quick failure recovery (figure 8)
-    Decent throughout even while failures happen
+ZooKeeper is a successful design.
+  see ZooKeeper's Wikipedia page for a list of projects that use it
+  Rarely eliminates all the complexity from distribution.
+    e.g. GFS master still needs to replicate file meta-data.
+    e.g. GFS primary has its own plan for replicating chunks.
+  But does bite off a bunch of common cases:
+    Master election.
+    Persistent master state (if state is small).
+    Who is the current master? (name service).
+    Worker registration.
+    Work queues.
+  
+Topics not covered:
+  persistence
+  details of batching and pipelining for performance
+  fuzzy snapshots
+  idempotent operations
+  duplicate client request detection
 
 References:
+  https://zookeeper.apache.org/doc/r3.4.8/api/org/apache/zookeeper/ZooKeeper.html
   ZAB: http://dl.acm.org/citation.cfm?id=2056409
   https://zookeeper.apache.org/
   https://cs.brown.edu/~mph/Herlihy91/p124-herlihy.pdf  (wait free, universal
   objects, etc.)
 
-### ZooKeeper FAQ
+ZooKeeper FAQ
 
-Q: Why are only update requests A-linearizable?
+Q: Why are only update requests A-linearizable? Why not reads as well?
 
-A: Because the authors want reads to scale with the number of servers,
-so they want to them to execute a server without requiring any
-interaction with other servers. This comes at the cost of
-consistency: they are allowed to return stale data.
+A: The authors want high total read throughput, so they want replicas
+to be able to satisfy client reads without involving the leader. A
+given replica may not know about a commited write (if it's not in the
+majority that the leader waited for), or may know about a write but
+not yet know if it is committed. Thus a replica's state may lag behind
+the leader and other replicas. Thus serving reads from replicas can
+yield data that doesn't reflect recent writes -- that is, reads can
+return stale results.
 
 Q: How does linearizability differ from serializability?
 
-A: Serializability is a correctness condition that is typically used for
-systems that provide transactions; that is, systems that support
-grouping multiple operations into an atomic operations.
-
-Linearizability is typically used for systems without transactions.
-When the Zookeeper paper refers to "serializable" in their definition
-of linearizability, they just mean a serial order.
-
-We talk about serializability in subsequent papers. Here is a blog
-post that explains the difference, if you are curious:
+A: The usual definition of serializability is much like
+linearizability, but without the requirement that operations respect
+real-time ordering. Have a look at this explanation:
 http://www.bailis.org/blog/linearizability-versus-serializability/
 
-Although the blog post gives precise definitions, designers are not
-that precise when using those terms when they describe their
-system, so often you have to glean from the context what
-correctness condition the designers are shooting for.
+Section 2.3 of the ZooKeeper paper uses "serializable" to indicate
+that the system behaves as if writes (from all clients combined) were
+executed one by one in some order. The "FIFO client order" property
+means that reads occur at specific points in the order of writes, and
+that a given client's successive reads never move backwards in that
+order. One thing that's going on here is that the guarantees for
+writes and reads are different.
 
 Q: What is pipelining?
 
-Zookeeper "pipelines" the operations in the client API (create,
-delete, exists, etc). What pipelining means here is that these
-operations are executed asynchronously by clients. The client calls
-create, delete, sends the operation to Zookeeper and then returns.
-At some point later, Zookeeper invokes a callback on the client that
-tells the client that the operation has been completed and what the
-results are. This asynchronous interface allow a client to pipeline
-many operations: after it issues the first, it can immediately issue a
-second one, and so on. This allows the client to achieve high
-throughput; it doesn't have to wait for each operation to complete
-before starting a second one.
+There are two things going on here. First, the ZooKeeper leader
+(really the leader's Zab layer) batches together multiple client
+operations in order to send them efficiently over the network, and in
+order to efficiently write them to disk. For both network and disk,
+it's often far more efficient to send a batch of N small items all at
+once than it is to send or write them one at a time. This kind of
+batching is only effective if the leader sees many client requests at
+the same time; so it depends on there being lots of active clients.
+
+The second aspect of pipelining is that ZooKeeper makes it easy for
+each client to keep many write requests outstanding at a time, by
+supporting asynchronous operations. From the client's point of view,
+it can send lots of write requests without having to wait for the
+responses (which arrive later, as notifications after the writes
+commit). From the leader's point of view, that client behavior gives
+the leader lots of requests to accumulate into big efficient batches.
 
 A worry with pipelining is that operations that are in flight might be
 re-ordered, which would cause the problem that the authors to talk
@@ -360,75 +324,102 @@ preceding writes have been applied. To ensure that this cannot
 happen, Zookeeper guarantees FIFO for client operations; that is the
 client operations are applied in the order they have been issued.
 
-Q: What about Zookeeper's use case makes wait-free better than locking?
-
-I think you mean "blocking" -- locking (as in, using locks) and blocking (as
-in, waiting for a request to return before issuing another one) are very
-different concepts.
-
-Many RPC APIs are blocking: consider, for example, clients in Lab 2/3 -- they
-only ever issue one request, patiently wait for it to either return or time out,
-and only then send the next one. This makes for an easy API to use and reason
-about, but doesn't offer great performance. For example, imagine you wanted to
-change 1,000 keys in Zookeeper -- by doing it one at a time, you'll spend most
-of your time waiting for the network to transmit requests and responses (this is
-what labs 2/3 do!). If you could instead have *several* requests in flight at
-the same time, you can amortize some of this cost. Zookeeper's wait-free API
-makes this possible, and allows for higher performance -- a key goal of the
-authors' use case.
-
 Q: What does wait-free mean?
 
-A: The precise definition is as follows: A wait-free implementation of
-a concurrent data object is one that guarantees that any process can
-complete any operation in a finite number of steps, regardless of the
-execution speeds of the other processes. This definition was
-introduced in the following paper by Herlihy:
+A: The precise definition: A wait-free implementation of a concurrent
+data object is one that guarantees that any process can complete any
+operation in a finite number of steps, regardless of the execution
+speeds of the other processes. This definition was introduced in the
+following paper by Herlihy:
 https://cs.brown.edu/~mph/Herlihy91/p124-herlihy.pdf
 
-The implementation of Zookeeper API is wait-free because requests return
-to clients without waiting for other, slow clients or servers. Specifically,
-when a write is processed, the server handling the client write returns as
-soon as it receives the state change (搂4.2). Likewise, clients' watches fire
-as a znode is modified, and the server does *not* wait for the clients to
-acknowledge that they've received the notification before returning to the
-writing client.
+Zookeeper is wait-free because it processes one client's requests
+without needing to wait for other clients to take action. This is
+partially a consequence of the API: despite being designed to support
+client/client coordination and synchronization, no ZooKeeper API call
+is defined in a way that would require one client to wait for another.
+In contrast, a system that supported a lock acquire operation that
+waited for the current lock holder to release the lock would not be
+wait-free.
 
-Some of the primitives that client can implement with Zookeeper APIs are
-wait-free too (e.g., group membership), but others are not (e.g., locks,
-barrier).
+Ultimately, however, ZooKeeper clients often need to wait for each
+other, and ZooKeeper does provide a waiting mechanism -- watches. The
+main effect of wait-freedom on the API is that watches are factored
+out from other operations. The combination of atomic test-and-set
+updates (e.g. file creation and writes condition on version) with
+watches allows clients to synthesize more complex blocking
+abstractions (e.g. Section 2.4's locks and barriers).
 
-Q: What is the reason for implementing 'fuzzy snapshots'? How can
-state changes be idempotent?
+Q: How does the leader know the order in which a client wants a bunch
+of asynchronous updates to be performed?
 
-A: If the authors had to decided to go for consistent snapshots,
-Zookeeper would have to stop all writes will making a snapshot for
-the in-memory database. You might remember that GFS went for
-this plan, but for large database, this could hurt the performance of
-Zookeeper seriously. Instead the authors go for a fuzzy snapshot
-scheme that doesn't require blocking all writes while the snapshot is
-made. After reboot, they construct a consistent snapshot by
-replaying the messages that were sent after the checkpoint started.
-Because all updates in Zookeeper are idempotent and delivered in
+A: The paper doesn't say. The answer is likely to involve the client
+numbering its asynchronous requests, and the leader tracking for each
+client (really session) what number it should next expect. The leader
+has to keep state per session anyway (for client session timeouts), so
+it might be little extra work to track a per-session request sequence
+number. This information would have to be preserved when a leader
+fails and another server takes over, so the client sequence numbers
+are likely passed along in replicated log entries.
+
+Q: What does a client do if it doesn't get a reply for a request? Does
+it re-send, in case the network lost a request or reply, or the leader
+crashed before committing? How does ZooKeeper avoid re-sends leading
+to duplicate executions?
+
+A: The paper doesn't say how all this works. Probably the leader
+tracks what request numbers from each session it has received and
+committed, so that it can filter out duplicate requests. Lab 3 has a
+similar arrangement.
+
+Q: If a client submits an asynchronous write, and immediately
+afterwards does a read, will the read see the effect of the write?
+
+A: The paper doesn't explicitly say, but the implication of the "FIFO
+client order" property of Section 2.3 is that the read will see the
+write. That seems to imply that a server may block a read until the
+server has received (from the leader) all of the client's preceding
+writes. ZooKeeper probably manages this by having the client send, in
+its read request, the zxid of the latest preceding operation that the
+client submitted.
+
+Q: What is the reason for implementing 'fuzzy snapshots'?
+
+A: A precise snapshot would correspond to a specific point in the log:
+the snapshot would include every write before that point, and no
+writes after that point; and it would be clear exactly where to start
+replay of log entries after a reboot to bring the snapshot up to date.
+However, creation of a precise snapshot requires a way to prevent any
+writes from happening while the snapshot is being created and written
+to disk. Blocking writes for the duration of snapshot creation would
+decrease performance a lot.
+
+The point of ZooKeeper's fuzzy snapshots is that ZooKeeper creates the
+snapshot from its in-memory database while allowing writes to the
+database. This means that a snapshot does not correspond to a
+particular point in the log -- a snapshot includes a more or less
+random subset of the writes that were concurrent with snapshot
+creation. After reboot, ZooKeeper constructs a consistent snapshot by
+replaying all log entries from the point at which the snapshot
+started. Because updates in Zookeeper are idempotent and delivered in
 the same order, the application-state will be correct after reboot and
-replay---some messages may be applied twice (once to the state
-before recovery and once after recovery) but that is ok, because they
-are idempotent. The replay fixes the fuzzy snapshot to be a consistent
+replay---some messages may be applied twice (once to the state before
+recovery and once after recovery) but that is ok, because they are
+idempotent. The replay fixes the fuzzy snapshot to be a consistent
 snapshot of the application state.
 
-Zookeeper turns the operations in the client API into something that
-it calls a transaction in a way that the transaction is idempotent. For
-example, if a client issues a conditional setData and the version
-number in the request matches, Zookeeper creates a setDataTXN
-that contains the new data, the new version number, and updated
-time stamps. This transaction (TXN) is idempotent: Zookeeper can
-execute it twice and it will result in the same state.
+The Zookeeper leader turns the operations in the client API into
+idempotent transactions. For example, if a client issues a conditional
+setData and the version number in the request matches, the Zookeeper
+leader creates a setDataTXN that contains the new data, the new
+version number, and updated time stamps. This transaction (TXN) is
+idempotent: Zookeeper can execute it twice and it will result in the
+same state.
 
 Q: How does ZooKeeper choose leaders?
 
 A: Zookeeper uses ZAB, an atomic broadcast system, which has leader
-election build in, much like Raft. If you are curious about the
-details, you can find a paper about ZAB here:
+election built in, much like Raft. Here's a paper about Zab:
 http://dl.acm.org/citation.cfm?id=2056409
 
 Q: How does Zookeeper's performance compare to other systems
@@ -436,7 +427,7 @@ such as Paxos?
 
 A: It has impressive performance (in particular throughput); Zookeeper
 would beat the pants of your implementation of Raft. 3 zookeeper
-server process 21,000 writes per second. Your raft with 3 servers
+servers process 21,000 writes per second. Your raft with 3 servers
 commits on the order of tens of operations per second (assuming a
 magnetic disk for storage) and maybe hundreds per second with
 SSDs.
@@ -444,23 +435,23 @@ SSDs.
 Q: How does the ordering guarantee solve the race conditions in
 Section 2.3?
 
-If a client issues many write operations to a z-node, and then the
+If a client issues many write operations to various z-nodes, and then the
 write to Ready, then Zookeeper will guarantee that all the writes
-will be applied to the z-node before the write to Ready. Thus, if
-another client observes Ready, then the all preceding writes must
-have been applied and thus it is ok for other clients to read the info
-in the z-node.
+will be applied to the z-nodes before the write to Ready. Thus, if
+another client observes Ready, then all the preceding writes must
+have been applied and thus it is ok for the client to read the info
+in the z-nodes.
 
 Q: How big is the ZooKeeper database? It seems like the server must
 have a lot of memory.
 
 It depends on the application, and, unfortunately, the paper doesn't
-report on it for the different application they have used Zookeeper
-with. Since Zookeeper is intended for configuration services/master
-services (and not for a general-purpose data store), however, an
-in-memory database seems reasonable. For example, you could
-imagine using Zookeeper for GFS's master and that amount of data
-should fit in the memory of a well-equipped server, as it did for GFS.
+report the authors' experience in this area. Since Zookeeper is
+intended for configuration and coordination, and not as a
+general-purpose data store, an in-memory database seems reasonable.
+For example, you could imagine using Zookeeper for GFS's master and
+that amount of data should fit in the memory of a well-equipped
+server, as it did for GFS.
 
 Q: What's a universal object?
 
@@ -471,11 +462,9 @@ spend any time on this statement and theory, but if you care there is
 a gentle introduction on this wikipedia page:
 https://en.wikipedia.org/wiki/Non-blocking_algorithm.
 
-The reason that authors appeal to this concurrent-object theory is
-that they claim that Zookeeper provides a good coordination kernel
-that enables new primitives without changing the service. By
-pointing out that Zookeeper is an universal object in this
-concurrent-object theory, they support this claim.
+The authors appeal to this concurrent-object theory in order to show
+that Zookeeper's API is general-purpose: that the API includes enough
+features to implement any coordination scheme you'd want.
 
 Q: How does a client know when to leave a barrier (top of page 7)?
 
@@ -484,7 +473,8 @@ all other clients participating in the barrier. Each client waits for
 all of them to be gone. If they are all gone, they leave the barrier
 and continue computing.
 
-Q: Is it possible to add more servers into an existing ZooKeeper without taking the service down for a period of time?
+Q: Is it possible to add more servers into an existing ZooKeeper
+without taking the service down for a period of time?
 
 It is -- although when the original paper was published, cluster
 membership was static. Nowadays, ZooKeeper supports "dynamic

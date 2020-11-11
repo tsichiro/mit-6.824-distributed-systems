@@ -1,241 +1,224 @@
-## LEC 12: Big Data: Spark
+6.824 2020 Lecture 15: Spark
 
-6.824 2018 Lecture 12: Spark Case Study
+Resilient Distributed Datasets: A Fault-Tolerant Abstraction for
+In-Memory Cluster Computing Zaharia et al., NSDI 2012
 
-Resilient Distributed Datasets: A Fault-Tolerant Abstraction for In-Memory Cluster Computing
-Zaharia, Chowdhury, Das, Dave, Ma, McCauley, Franklin, Shenker, Stoica
-NSDI 2012
+why are we looking at Spark?
+  widely-used for datacenter computations
+  generalizes MapReduce into dataflow
+  supports iterative applications better than MapReduce
+  successful research: ACM doctoral thesis award
 
-Today: more distributed computations
-  Case study: Spark
-  Why are we reading Spark?
-    Widely-used for datacenter computations
-    popular open-source project, hot startup (Databricks)
-    Support iterative applications better than MapReduce
-    Interesting fault tolerance story
-    ACM doctoral thesis award
+three main topics:
+  programming model
+  execution strategy
+  fault tolerance
 
-MapReduce make life of programmers easy
-  It handles:
-    Communication between nodes
-    Distribute code
-    Schedule work
-    Handle failures
-  But restricted programming model
-    Some apps don't fit well with MapReduce
+let's look at page-rank
+  here's SparkPageRank.scala from the Spark source repository
+  like the code in Section 3.2.2, with more detail
 
-Many algorithms are iterative
-  Page-rank is the classic example
-    compute a rank for each document, based on how many docs point to it
-    the rank is used to determine the place of the doc in the search results
-  on each iteration, each document:
-    sends a contribution of r/n to its neighbors
-       where r is its rank and n is its number of neighbors.
-    update rank to alpha/N + (1 - alpha)*Sum(c_i),
-       where the sum is over the contributions it received
-       N is the total number of documents.
-  big computation:
-    runs over all web pages in the world
-    even with many machines it takes long time
+     1      val lines = spark.read.textFile("in").rdd
+     2      val links1 = lines.map{ s =>
+     3        val parts = s.split("\\s+")
+     4        (parts(0), parts(1))
+     5      }
+     6      val links2 = links1.distinct()
+     7      val links3 = links2.groupByKey()
+     8      val links4 = links3.cache()
+     9      var ranks = links4.mapValues(v => 1.0)
+    10  
+    11      for (i <- 1 to 10) {
+    12        val jj = links4.join(ranks)
+    13        val contribs = jj.values.flatMap{
+    14          case (urls, rank) =>
+    15            urls.map(url => (url, rank / urls.size))
+    16        }
+    17        ranks = contribs.reduceByKey(_ + _).mapValues(0.15 + 0.85 * _)
+    18      }
+    19  
+    20      val output = ranks.collect()
+    21      output.foreach(tup => println(s"${tup._1} has rank:  ${tup._2} ."))
 
-MapReduce and iterative algorithms
-  MapReduce would be good at one iteration of the algorithms
-    Each map does part of the documents
-    Reduce for update the rank of a particular doc
-  But what to do for the next iteration?
-    Write results to storage
-    Start a new MapReduce job for the next iteration
-    Expensive
-    But fault tolerant
+page-rank input has one line per link, extracted from a big web crawl
+  from-url to-url
+  the input is vast!
 
-Challenges
-  Better programming model for iterative computations
-  Good fault tolerance story
+page-rank output is the "importance" of each page
+  based on whether other important pages point to it
+  really models estimated probability that someone will visit each page
+  user model:
+    85% chance of following a link from current page
+    15% chance of visiting a random page
 
-One solution: use DSM
-  Good for iterative programming
-    ranks can be in shared memory
-    workers can update and read
-  Bad for fault tolerance
-    typical plan: checkpoint state of memory
-      make a checkpoint every hour of memory
-    expensive in two ways:
-      write shared memory to storage during computation
-      redo all work since last checkpoint after failure
-  Spark more MapReduce flavor
-    Restricted programming model, but more powerful than MapReduce
-    Good fault tolerance plan
+page-rank algorithm
+  iterative, essentially simulates multiple rounds of users clicking links
+  ranks (probabilities) gradually converge
+  page-rank would be awkward and slow in MapReduce
 
-Better solution: keep data in memory
-  Pregel, Dryad, Spark, etc.
-  In Spark
-    Data is stored in data sets (RDDs)
-    "Persist" the RDD in memory
-    Next iteration can refer to the RDD
+my example input -- file "in":
+  u1 u3
+  u1 u1
+  u2 u3
+  u2 u2
+  u3 u1
+  
+I'll run page-rank in Spark (local machine, not a cluster):
+  ./bin/run-example SparkPageRank in 10
+  u2 has rank:  0.2610116705534049 .
+  u3 has rank:  0.9999999999999998 .
+  u1 has rank:  1.7389883294465944 .
 
-Other opportunities
-  Interactive data exploration
-    Run queries over the persisted RDDs
-  Like to have something SQL-like
-    A join operator over RDDs
+apparently u1 is the most important page.
 
-Core idea in Spark: RDDs
-  RDDs are immutable --- you cannot update them
-  RDDs support transformations and actions
-  Transformations:  compute a new RDD from existing RDDs
-    map, reduceByKey, filter, join, ..
-    transformations are lazy: don't compute result immediately
-    just a description of the computation
-  Actions: for when results are needed
-    counts result, collect results, get a specific value
+let's run some of the page-rank code in the Scala interpreter
+    ./bin/spark-shell
 
-Example use:
-  lines = spark.textFile("hdfs://...")
-  errors = lines.filter(_.startsWith("ERROR"))    // lazy!
-  errors.persist()    // no work yet
-  errors.count()      // an action that computes a result
-  // now errors is materialized in memory
-  // partitioned across many nodes
-  // Spark, will try to keep in RAM (will spill to disk when RAM is full)
+    val lines = spark.read.textFile("in").rdd
+      -- what is lines? does it contain the content of file "in"?
+    lines.collect()
+      -- lines yields a list of strings, one per line of input
+      -- if we run lines.collect() again, it re-reads file "in"
+    val links1 = lines.map{ s => val parts = s.split("\\s+"); (parts(0), parts(1)) }
+    links1.collect()
+      -- map, split, tuple -- acts on each line in turn
+      -- parses each string "x y" into tuple ( "x", "y" )
+    val links2 = links1.distinct()
+      -- distinct() sorts or hashes to bring duplicates together
+    val links3 = links2.groupByKey()
+      -- groupByKey() sorts or hashes to bring instances of each key together
+    val links4 = links3.cache()
+      -- cache() == persist in memory
+    var ranks = links4.mapValues(v => 1.0)
 
-Reuse of an RDD
-  errors.filter(_.contains("MySQL")).count()
-  // this will be fast because reuses results computed by previous fragment
-  // Spark will schedule jobs across machines that hold partition of errors
+    -- now for first loop iteration
+    val jj = links4.join(ranks)
+      -- the join brings each page's link list and current rank together
+    val contribs = jj.values.flatMap{ case (urls, rank) => urls.map(url => (url, rank / urls.size)) }
+      -- for each link, the "from" page's rank divided by number of its links
+    ranks = contribs.reduceByKey(_ + _).mapValues(0.15 + 0.85 * _)
+      -- sum up the links that lead to each page
 
-Another reuse of RDD
-  errors.filter(_.contains("HDFS")).map(_.split('\t')(3)).collect()
+    -- second loop iteration
+    val jj2 = links4.join(ranks)
+      -- join() brings together equal keys; must sort or hash
+    val contribs2 = jj2.values.flatMap{ case (urls, rank) => urls.map(url => (url, rank / urls.size)) }
+    ranks = contribs2.reduceByKey(_ + _).mapValues(0.15 + 0.85 * _)
+      -- reduceByKey() brings together equal keys
 
-RDD lineage
-  Spark creates a lineage graph on an action
-  Graphs describe the computation using transformations
-    lines -> filter w ERROR -> errors -> filter w. HDFS -> map -> timed fields
-  Spark uses the lineage to schedule job
-    Transformation on the same partition form a stage
-      Joins, for example, are a stage boundary
-      Need to reshuffle data
-    A job runs a single stage
-      pipeline transformation within a stage
-    Schedule job where the RDD partition is
+    -- the loop &c just creates a lineage graph.
+    -- it does not do any real work.
 
-Lineage and fault tolerance
-  Great opportunity for *efficient* fault tolerance
-    Let's say one machine fails
-    Want to recompute *only* its state
-    The lineage tells us what to recompute
-      Follow the lineage to identify all partitions needed
-      Recompute them
-  For last example, identify partitions of lines missing
-    Trace back from child to parents in lineage
-    All dependencies are "narrow"
-      each partition is dependent on one parent partition
-    Need to read the missing partition of lines
-      recompute the transformations
+    val output = ranks.collect()
+      -- collect() is an action.
+      -- it causes the whole computation to execute!
+    output.foreach(tup => println(s"${tup._1} has rank:  ${tup._2} ."))
 
-RDD implementation
-  list of partitions
-  list of (parent RDD, wide/narrow dependency)
-    narrow: depends on one parent partition  (e.g., map)
-    wide: depends on several parent partitions (e.g., join)
-  function to compute (e.g., map, join)
-  partitioning scheme (e.g., for file by block)
-  computation placement hint
+until the final collect(), this code just creates a lineage graph
+  it does not process the data
 
-Each transformation takes (one or more) RDDs, and outputs the transformed RDD.
+what does the lineage graph look like?
+  Figure 3
+  it's a graph of transform stages -- a data-flow graph
+  it's a complete recipe for the computation
+  note that the loop added to the graph -- there is not actually a cycle
+    there's a *new* ranks/contribs for each loop iteration
 
-Q: Why does an RDD carry metadata on its partitioning?  A: so transformations
-  that depend on multiple RDDs know whether they need to shuffle data (wide
-  dependency) or not (narrow). Allows users control over locality and reduces
-  shuffles.
+for multi-step computation, this programming model is more convenient than MapReduce
 
-Q: Why the distinction between narrow and wide dependencies?  A: In case of
-  failure.  Narrow dependency only depends on a few partitions that need to be
-  recomputed.  Wide dependency might require an entire RDD
+the Scala code runs in the "driver" machine of Figure 2
+  the driver constructs a lineage graph
+  the driver compiles Java bytecodes and sends them to worker machines
+  the driver then manages execution and data movement
 
-Example: PageRank (from paper):
-  // Load graph as an RDD of (URL, outlinks) pairs
-  val links = spark.textFile(...).map(...).persist() // (URL, outlinks)
-  var ranks = // RDD of (URL, rank) pairs
-  for (i <- 1 to ITERATIONS) {
-    // Build an RDD of (targetURL, float) pairs
-    // with the contributions sent by each page
-    val contribs = links.join(ranks).flatMap {
-      (url, (links, rank)) => links.map(dest => (dest, rank/links.size))
-    }
-    // Sum contributions by URL and get new ranks
-    ranks = contribs.reduceByKey((x,y) => x+y)
-     .mapValues(sum => a/N + (1-a)*sum)
-  }
+what does the execution look like?
+  [diagram: driver, partitioned input file, workers]
+  * input in HDFS (like GFS)
+  * input data files are already "partitioned" over many storage servers
+    first 1,000,000 lines in one partition, next lines in another, &c.
+  * more partitions than machines, for load balance
+  * each worker machine takes a partition, applies lineage graph in order
+  * when computation on different partitions is independent ("narrow"):
+    no inter-machine communication required after first read
+    a worker applies series of transformations to input stream
 
-Lineage for PageRank
-  See figure 3
-  Each iteration creates two new RDDs:
-    ranks0, ranks1, etc.
-    contribs0, contribs1, etc.
-  Long lineage graph!
-    Risky for fault tolerance.
-    One node fails, much recomputation
-  Solution: user can replicate RDD
-    Programmer pass "reliable" flag to persist()
-     e.g., call ranks.persist(RELIABLE) every N iterations
-    Replicates RDD in memory
-    With REPLICATE flag, will write to stable storage (HDFS)
-  Impact on performance
-   if user frequently perist w/REPLICATE, fast recovery, but slower execution
-   if infrequently, fast execution but slow recovery
+this is already more efficient than MapReduce
+  data is forwarded directly from one transformation to the next
+  MR would need multiple Map+Reduces
+    with expensive store to GFS, then re-read, between each
 
-Q: Is persist a transformation or an action?  A: neither. It doesn't create a
- new RDD, and doesn't cause materialization. It's an instruction to the
- scheduler.
+what about distinct()? groupByKey()? join()? reduceByKey()?
+  these need to look at data from *all* partitions, not just one
+  because all records with a given key must be considered together
+  these are the paper's "wide" dependencies (as opposed to "narrow")
 
-Q: By calling persist without flags, is it guaranteed that in case of fault that
-  RDD wouldn't have to be recomputed?  A: No. There is no replication, so a node
-  holding a partition could fail.  Replication (either in RAM or in stable
-  storage) is necessary
+how are wide dependencies implemented?
+  [diagram]
+  a lot like Map intermediate output in MapReduce
+  the driver knows where the wide dependencies are
+    e.g. between the map() and the distinct() in page-rank
+    upstream transformation, downstream transformation
+  the data must be "shuffled" into new partitions
+    e.g. bring all of a given key together
+  after the upstream transformation:
+    split output up by shuffle criterion (typically some key)
+    arrange into buckets in memory, one per downstream partition
+  before the downstream transformation:
+    (wait until upstream transformation completes -- driver manages this)
+    each worker fetches its bucket from each upstream worker
+    now the data is partitioned in a different way
+  wide is expensive!
+    all data is moved across the network
+    it's a barrier -- all workers must wait until all are done
 
-Currently only manual checkpointing via calls to persist.  Q: Why implement
-  checkpointing? (it's expensive) A: Long lineage could cause large recovery
-  time. Or when there are wide dependencies a single failure might require many
-  partition re-computations.
+what if data is re-used?
+  e.g. links4 in our page-rank
+  by default, must be re-computed, e.g. re-read from input file
+  persist() and cache() cause links to be saved in memory for re-use
 
-Q: Can Spark handle network partitions? A: Nodes that cannot communicate with
-  scheduler will appear dead. The part of the network that can be reached from
-  scheduler can continue computation, as long as it has enough data to start the
-  lineage from (if all replicas of a required partition cannot be reached,
-  cluster cannot make progress)
+re-using persisted data is another big advantage over MapReduce
 
-What happens when there isn't enough memory?
-  LRU (Least Recently Used) on partitions
-     first on non-persisted
-     then persisted (but they will be available on disk. makes sure user cannot overbook RAM)
-  User can have control on order of eviction via "persistence priority"
-  No reason not to discard non-persisted partitions (if they've already been used)
+Spark can optimized based on its view of the whole lineage graph
+  stream records, one at a time, though sequence of narrow transformations
+    increases locality, good for CPU data caches
+    avoids having to store entire partition of records in memory
+  notice when shuffles aren't needed b/c inputs already partitioned in the same way
+    e.g. links4.join(ranks)
 
-Performance
-  Degrades to "almost" MapReduce behavior
-  In figure 7, logistic regression on 100 Hadoop nodes takes 76-80 seconds
-  In figure 12, logistic regression on 25 Spark nodes (with no partitions allowed in memory)
-    takes 68.8
-  Difference could be because MapReduce uses replicated storage after reduce, but Spark by
-  default only spills to local disk
-    no network latency and I/O load on replicas.
-  no architectural reason why MR would be slower than Spark for non-iterative work
-    or for iterative work that needs to go to disk
-  no architectural reason why Spark would ever be slower than MR
+what about fault tolerance?
+  what if one machine crashes?
+  its memory and computation state are lost
+  driver re-runs transformations on crashed machine's partitions on other machines
+    usually each machine is responsible for many partitions
+    so load can be spread
+    thus re-computation is pretty fast
+  for narrow dependencies, only lost partitions have to be re-executed
 
-Discussion
-  Spark targets batch, iterative applications
-  Spark can express other models
-    MapReduce, Pregel
-  Cannot incorporate new data as it comes in
-    But see Streaming Spark
-  Spark not good for building key/value store
-    Like MapReduce, and others
-    RDDs are immutable
+what about failures when there are wide dependencies?
+  re-computing one failed partition requires information from *all* partitions
+  so *all* partitions may need to re-execute from the start!
+    even though they didn't fail
+  Spark supports checkpoints to HDFS (like GFS) to cope with this
+    driver only has to recompute along lineage from latest checkpoint
+  for page-rank, perhaps checkpoint ranks every 10th iteration
 
-References
-  http://spark.apache.org/
-  http://www.cs.princeton.edu/~chazelle/courses/BIB/pagerank.htm
+limitations?
+  geared up for batch processing of bulk data
+  all records treated the same way
+  transformations are "functional" -- turn input into output
+    no notion of modifying data in place
+
+summary
+  Spark improves expressivity and performance vs MapReduce
+  giving the framework a view of the complete dataflow is helpful
+    performance optimizations
+    failure recovery
+  what were the keys to performance?
+    leave data in memory between transformations, vs write to GFS then read
+    re-use of data in memory (e.g. links in page-rank)
+  Spark very successful, widely used
+
+Spark FAQ
 
 Q: Is Spark currently in use in any major applications?
 
@@ -351,6 +334,3 @@ deprecated: Spark has recently moved towards something called "DataFrames"
 (https://spark.apache.org/docs/latest/sql-programming-guide.html#datasets-and-dataframes),
 which implements a more column-oriented representation while maintaining
 the good ideas from RDDs.
-
-
-

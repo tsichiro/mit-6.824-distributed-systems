@@ -1,44 +1,44 @@
-## LEC 16: Cache Consistency: Memcached at Facebook
-
-6.824 2015 Lecture 16: Scaling Memcache at Facebook
+6.824 2020 Lecture 16: Scaling Memcache at Facebook
 
 Scaling Memcache at Facebook, by Nishtala et al, NSDI 2013
 
 why are we reading this paper?
   it's an experience paper, not about new ideas/techniques
   three ways to read it:
-    cautionary tale of problems from not taking consistency seriously
+    cautionary tale about not taking consistency seriously from the start
     impressive story of super high capacity from mostly-off-the-shelf s/w
     fundamental struggle between performance and consistency
   we can argue with their design, but not their success
 
-how do web sites scale up with growing load?
+how do web sites cope as they get more users?
   a typical story of evolution over time:
-  1. one machine, web server, application, DB
-     DB stores on disk, crash recovery, transactions, SQL
-     application queries DB, formats, HTML, &c
-     but the load grows, your PHP application takes too much CPU time
+  1. single machine w/ web server + application + DB
+     DB provides persistent storage, crash recovery, transactions, SQL
+     application queries DB, formats HTML, &c
+     but: as load grows, application takes too much CPU time
   2. many web FEs, one shared DB
      an easy change, since web server + app already separate from storage
      FEs are stateless, all sharing (and concurrency control) via DB
-     but the load grows; add more FEs; soon single DB server is bottleneck
+       stateless -> any FE can serve any request, no harm from FE crash
+     but: as load grows, need more FEs, soon single DB server is bottleneck
   3. many web FEs, data sharded over cluster of DBs
      partition data by key over the DBs
        app looks at key (e.g. user), chooses the right DB
      good DB parallelism if no data is super-popular
      painful -- cross-shard transactions and queries probably don't work
        hard to partition too finely
-     but DBs are slow, even for reads, why not cache read requests?
+     but: DBs are slow, even for reads, why not cache read requests?
   4. many web FEs, many caches for reads, many DBs for writes
      cost-effective b/c read-heavy and memcached 10x faster than a DB
        memcached just an in-memory hash table, very simple
      complex b/c DB and memcacheds can get out of sync
+     fragile b/c cache misses can easily overload the DB
      (next bottleneck will be DB writes -- hard to solve)
 
 the big facebook infrastructure picture
   lots of users, friend lists, status, posts, likes, photos
-    fresh/consistent data apparently not critical
-    because humans are tolerant?
+    fresh/consistent data not critical
+      humans are tolerant
   high load: billions of operations per second
     that's 10,000x the throughput of one DB server
   multiple data centers (at least west and east coast)
@@ -47,9 +47,12 @@ the big facebook infrastructure picture
     memcached layer (mc)
     web servers (clients of memcached)
   each data center's DBs contain full replica
-  west coast is master, others are slaves via MySQL async log replication
+  west coast is primary, others are secondary replicas via MySQL async log replication
 
-how do FB apps use mc?
+how do FB apps use mc? Figure 1.
+  FB uses mc as a "look-aside" cache
+    real data is in the DB
+    cached value (if any) should be same as DB
   read:
     v = get(k) (computes hash(k) to choose mc server)
     if v is nil {
@@ -62,66 +65,71 @@ how do FB apps use mc?
     delete(k)
   application determines relationship of mc to DB
     mc doesn't know anything about DB
-  FB uses mc as a "look-aside" cache
-    real data is in the DB
-    cached value (if any) should be same as DB
 
 what does FB store in mc?
   paper does not say
   maybe userID -> name; userID -> friend list; postID -> text; URL -> likes
-  basically copies of data from DB
+  data derived from DB queries
 
 paper lessons:
-  look-aside is much trickier than it looks -- consistency
+  look-aside caching is trickier than it looks -- consistency
     paper is trying to integrate mutually-oblivious storage layers
   cache is critical:
     not really about reducing user-visible delay
-    mostly about surviving huge load!
-    cache misses and failures can create intolerable DB load
-  they can tolerate modest staleness: no freshness guarantee
-  stale data nevertheless a big headache
+    mostly about shielding DB from huge overload!
+  human users can tolerate modest read staleness
+  stale reads nevertheless potentially a big headache
     want to avoid unbounded staleness (e.g. missing a delete() entirely)
     want read-your-own-writes
-    each performance fix brings a new source of staleness
+    more caches -> more sources of staleness
   huge "fan-out" => parallel fetch, in-cast congestion
 
 let's talk about performance first
   majority of paper is about avoiding stale data
   but staleness only arose from performance design
 
-performance comes from parallel get()s by many mc servers
-  driven by parallel processing of HTTP requests by many web servers
+performance comes from parallelism due to many servers
+  many active users, many web servers (clients)
   two basic parallel strategies for storage: partition vs replication
 
 will partition or replication yield most mc throughput?
-  partition: server i, key k -> mc server hash(k)
-  replicate: server i, key k -> mc server hash(i)
-  partition is more memory efficient (one copy of each k/v)
-  partition works well if no key is very popular
-  partition forces each web server to talk to many mc servers (overhead)
-  replication works better if a few keys are very popular
+  partition: divide keys over mc servers
+  replicate: divide clients over mc servers
+  partition:
+    + more memory-efficient (one copy of each k/v)
+    + works well if no key is very popular
+    - each web server must talk to many mc servers (overhead)
+  replication:
+    + good if a few keys are very popular
+    + fewer TCP connections
+    - less total data can be cached
 
 performance and regions (Section 5)
 
+[diagram: west, db primary shards, mc servers, clients | east, db secondary shards, ...
+ feed from db primary to secondary ]
+
 Q: what is the point of regions -- multiple complete replicas?
    lower RTT to users (east coast, west coast)
-   parallel reads of popular data due to replication
-   (note DB replicas help only read performance, no write performance)
+   quick local reads, from local mc and DB
+   (though writes are expensive: must be sent to primary)
    maybe hot replica for main site failure?
 
 Q: why not partition users over regions?
    i.e. why not east-coast users' data in east-coast region, &c
-   social net -> not much locality
-   very different from e.g. e-mail
+   then no need to replicate: might cut hardware costs in half!
+   but: social net -> not much locality
+   might work well for e.g. e-mail
 
-Q: why OK performance despite all writes forced to go to the master region?
-   writes would need to be sent to all regions anyway -- replicas
-   users probably wait for round-trip to update DB in master region
-     only 100ms, not so bad
+Q: why OK performance despite all writes forced to go to the primary region?
+   writes are much rarer than reads
+   perhaps 100ms to send write to primary, not so bad for human users
    users do not wait for all effects of writes to finish
      i.e. for all stale cached values to be deleted
    
 performance within a region (Section 4)
+
+[diagram: db shards, multiple clusters, each w/ mc's and clients ]
 
 multiple mc clusters *within* each region
   cluster == complete set of mc cache servers
@@ -145,43 +153,21 @@ why multiple clusters per region?
 but -- replicating is a waste of RAM for less-popular items
   "regional pool" shared by all clusters
   unpopular objects (no need for many copies)
-  decided by *type* of object
+  the application s/w decides what to put in regional pool
   frees RAM to replicate more popular objects
 
-bringing up new mc cluster was a serious performance problem
+bringing up new mc cluster is a performance problem
   new cluster has 0% hit rate
   if clients use it, will generate big spike in DB load
-    if ordinarily 1% miss rate, and (let's say) 2 clusters,
-      adding "cold" third cluster will causes misses for 33% of ops.
-    i.e. 30x spike in DB load!
+    if ordinarily 1% miss rate,
+      adding "cold" second cluster will causes misses for 50% of ops.
+    i.e. 50x spike in DB load!
   thus the clients of new cluster first get() from existing cluster (4.3)
     and set() into new cluster
     basically lazy copy of existing cluster to new cluster
   better 2x load on existing cluster than 30x load on DB
 
-important practical networking problems:
-  n^2 TCP connections is too much state
-    thus UDP for client get()s
-  UDP is not reliable or ordered
-    thus TCP for client set()s
-    and mcrouter to reduce n in n^2
-  small request per packet is not efficient (for TCP or UDP)
-    per-packet overhead (interrupt &c) is too high
-    thus mcrouter batches many requests into each packet
-    
-mc server failure?
-  can't have DB servers handle the misses -- too much load
-  can't shift load to one other mc server -- too much
-  can't re-partition all data -- time consuming
-  Gutter -- pool of idle servers, clients only use after mc server fails
-
-The Question:
-  why don't clients send invalidates to Gutter servers?
-  my guess: would double delete() traffic
-    and send too many delete()s to small gutter pool
-    since any key might be in the gutter pool
-
-thundering herd
+another overload problem: thundering herd
   one client updates DB and delete()s a key
   lots of clients get() but miss
     they all fetch from DB
@@ -192,62 +178,77 @@ thundering herd
     mc tells others "try get() again in a few milliseconds"
   effect: only one client reads the DB and does set()
     others re-try get() later and hopefully hit
+    
+what if an mc server fails?
+  can't have DB servers handle the misses -- too much load
+  can't shift load to one other mc server -- too much
+  can't re-partition all data -- time consuming
+  Gutter -- pool of idle mc servers, clients only use after mc server fails
+  after a while, failed mc server will be replaced
+
+The Question:
+  why don't clients send invalidates to Gutter servers?
+  my guess: would double delete() traffic
+    and send too many delete()s to small gutter pool
+    since any key might be in the gutter pool
+
+important practical networking problems:
+  n^2 TCP connections is too much state
+    thus UDP for client get()s
+  UDP is not reliable or ordered
+    thus TCP for client set()s
+    and mcrouter to reduce n in n^2
+  single request per packet is not efficient (for TCP or UDP)
+    per-packet overhead (interrupt &c) is too high
+    thus mcrouter batches many requests into each packet
 
 let's talk about consistency now
 
-the big truth
-  hard to get both consistency (== freshness) and performance
-  performance for reads = many copies
-  many copies = hard to keep them equal
-
 what is their consistency goal?
-  *not* read sees latest write
-    since not guaranteed across clusters
+  writes go direct to primary DB, with transactions, so writes are consistent
+  what about reads?
+  reads do not always see the latest write
+    e.g. since not guaranteed across clusters
   more like "not more than a few seconds stale"
     i.e. eventual
-  *and* writers see their own writes
+  *and* writers see their own writes (due to delete())
     read-your-own-writes is a big driving force
 
 first, how are DB replicas kept consistent across regions?
-  one region is master
-  master DBs distribute log of updates to DBs in slave regions
-  slave DBs apply
-  slave DBs are complete replicas (not caches)
+  one region is primary
+  primary DBs distribute log of updates to DBs in secondary regions
+  secondary DBs apply
+  secondary DBs are complete replicas (not caches)
   DB replication delay can be considerable (many seconds)
-
-how do we feel about the consistency of the DB replication scheme?
-  good: eventual consistency, b/c single ordered write stream
-  bad: longish replication delay -> stale reads
 
 how do they keep mc content consistent w/ DB content?
   1. DBs send invalidates (delete()s) to all mc servers that might cache
+     this is McSqueal in Figure 6
   2. writing client also invalidates mc in local cluster
-     for read-your-writes
+     for read-your-own-writes
 
-why did they have consistency problems in mc?
-  client code to copy DB to mc wasn't atomic:
-    1. writes: DB update ... mc delete()
-    2. read miss: DB read ... mc set()
-  so *concurrent* clients had races
+they ran into a number of DB-vs-mc consistency problems
+  due to races when multiple clients read from DB and put() into mc
+  or: there is not a single path along which updates flow in order
 
 what were the races and fixes?
 
 Race 1:
   k not in cache
   C1 get(k), misses
-  C1 v = read k from DB
-    C2 updates k in DB
-    C2 and DB delete(k) -- does nothing
-  C1 set(k, v)
+  C1 v1 = read k from DB
+    C2 writes k = v2 in DB
+    C2 delete(k)
+  C1 set(k, v1)
   now mc has stale data, delete(k) has already happened
-  will stay stale indefinitely, until key is next written
-  solved with leases -- C1 gets a lease, but C2's delete() invalidates lease,
+  will stay stale indefinitely, until k is next written
+  solved with leases -- C1 gets a lease from mc, C2's delete() invalidates lease,
     so mc ignores C1's set
     key still missing, so next reader will refresh it from DB
 
 Race 2:
   during cold cluster warm-up
-  remember clients try get() in warm cluster, copy to cold cluster
+  remember: on miss, clients try get() in warm cluster, copy to cold cluster
   k starts with value v1
   C1 updates k to v2 in DB
   C1 delete(k) -- in cold cluster
@@ -257,22 +258,22 @@ Race 2:
   now mc has stale v1, but delete() has already happened
     will stay stale indefinitely, until key is next written
   solved with two-second hold-off, just used on cold clusters
-    after C1 delete(), cold ignores set()s for two seconds
-    by then, delete() will propagate via DB to warm cluster
+    after C1 delete(), cold mc ignores set()s for two seconds
+    by then, delete() will (probably) propagate via DB to warm cluster
 
 Race 3:
   k starts with value v1
-  C1 is in a slave region
-  C1 updates k=v2 in master DB
+  C1 is in a secondary region
+  C1 updates k=v2 in primary DB
   C1 delete(k) -- local region
   C1 get(k), miss
   C1 read local DB  -- sees v1, not v2!
-  later, v2 arrives from master DB
+  later, v2 arrives from primary DB
   solved by "remote mark"
     C1 delete() marks key "remote"
-    get()/miss yields "remote"
-      tells C1 to read from *master* region
-    "remote" cleared when new data arrives from master region
+    get() miss yields "remote"
+      tells C1 to read from *primary* region
+    "remote" cleared when new data arrives from primary region
 
 Q: aren't all these problems caused by clients copying DB data to mc?
    why not instead have DB send new values to mc, so clients only read mc?
@@ -285,11 +286,157 @@ A:
   3. DB doesn't know what's cached, would end up sending lots
      of values for keys that aren't cached
 
-PNUTS does take this alternate approach of master-updates-all-copies
+PNUTS does take this alternate approach of primary-updates-all-copies
 
 FB/mc lessons for storage system designers?
-  cache is vital to throughput survival, not just a latency tweak
+  cache is vital for throughput survival, not just to reduce latency
   need flexible tools for controlling partition vs replication
   need better ideas for integrating storage layers with consistency
 
+6.824 Scaling Memcached at Facebook FAQ
 
+Q: The paper mentions that memcached serves stale data under a number
+of circumstances. Why is that OK?
+
+A: The cached data is typically displayed to users on web pages. If
+the data is out of date by a fraction of a second, users will usually
+not notice.
+
+But note that updates are sent to MySQL database servers, which
+provide strong consistency, transactions, and durable storage. So
+while the reads that generate web pages are not very consistent,
+updates are quite careful.
+
+Q: The paper is all about ensuring that memcached doesn't cached stale
+data. Why does it make sense that the system both tolerates stale
+data, and goes to great lengths to avoid stale data?
+
+A: The big danger they are avoiding is long-term caching of stale
+data. It's OK to serve data that's out of date by a few seconds. It's
+not OK to serve data that's out of date by hours. Without the paper's
+machinery, unbounded memcached staleness could arise due to lost
+deletes or out of order updates.
+
+Q: Why do they use memcached at all? Why not just read directly from
+the MySQL database servers in the "storage cluster"?
+
+A: The MySQL servers are not nearly fast enough to serve the volume of
+reads generated by Facebook's web servers. memcached is orders of
+magnitude faster than MySQL.
+
+Q: What's the difference between the paper's "memcached" and "memcache"?
+
+A: "memcached" refers to the software, which you can find here:
+
+  https://github.com/memcached/memcached
+
+memcached is a very simple and very fast key/value server. It stores
+data in RAM, with no fault tolerance, so people use it for caching (not
+for persistent storage).
+
+The paper uses "memcache" to refer to Facebook's set of servers
+running memcached.
+
+Q: What is the "stale set" problem in 3.2.1, and how do leases solve it?
+
+A: Here's an example of the "stale set" problem:
+
+1. Client C1 asks memcache for k; memcache says k doesn't exist.
+2. C1 asks MySQL for k, MySQL replies with value 1.
+   C1 is slow at this point for some reason...
+3. Someone updates k's value in MySQL to 2.
+4. MySQL/mcsqueal/mcrouter send an invalidate for k to memcache,
+   though memcache is not caching k, so there's nothing to invalidate.
+5. C2 asks memcache for k; memcache says k doesn't exist.
+6. C2 asks MySQL for k, mySQL replies with value 2.
+7. C2 installs k=2 in memcache.
+8. C1 installs k=1 in memcache.
+
+Now memcache has a stale version of k, and it may never be updated.
+
+The paper's leases would fix the example in the following way:
+
+1. Client C1 asks memcache for k; memcache says k doesn't exist,
+   and returns lease L1 to C1.
+2. C1 asks MySQL for k, MySQL replies with value 1.
+   C1 is slow at this point for some reason...
+3. Someone updates k's value in MySQL to 2.
+4. MySQL/mcsqueal/mcrouter send an invalidate for k to memcache,
+   though memcache is not caching k, so there's nothing to invalidate.
+   But memcache does invalidate C1's lease L1 (deletes L1 from its set
+   of valid leases).
+5. C2 asks memcache for k; memcache says k doesn't exist,
+   and returns lease L2 to C2 (since there was no current lease for k).
+6. C2 asks MySQL for k, mySQL replies with value 2.
+7. C2 installs k=2 in memcache, supplying valid lease L2.
+8. C1 installs k=1 in memcache, supplying invalid lease L1,
+   so memcache ignores C1.
+
+Now memcache is left caching the correct k=2.
+
+Q: What is the "thundering herd" problem in 3.2.1, and how do leases
+solve it?
+
+A: The thundering herd problem:
+
+* key k is very popular -- lots of clients read it.
+* ordinarily clients read k from memcache, which is fast.
+* but suppose someone writes k, causing it to be invalidated in memcache.
+* for a while, every client that tries to read k will miss in memcache.
+* they will all ask MySQL for k.
+* MySQL may be overloaded with too many simultaneous requests.
+
+The paper's leases solve this problem by allowing only the first
+client that misses to ask MySQL for the latest data.
+
+Q: What is McRouter?
+
+A: The point of mcrouter is to aggregate memcached RPCs from many
+clients and send them in big batches to memcached servers. It's more
+efficient to have a smallish number of mcrouter servers talk to
+memcached than a large number of individual clients. One reason is
+that there's overhead to each network (TCP) connection; better that
+each memcached have a TCP connection per mcrouter than per client.
+Another reason is that there's overhead (packet header space and
+interrupt) for each packet, so it's helpful that a mcrouter can pack
+many client requests into each TCP packet.
+
+Q: Isn't it wasteful that the gutter servers are idle when they aren't
+taking over for a failed server? Why not use the gutter servers for
+ordinary memcached service as well as gutter?
+
+A: I think non-gutter memcached servers are often close to fully
+loaded, and have little spare capacity. If one fails, the replacement
+server needs to have been more or less idle, in order to handle the
+failed server's load.
+
+Q: How do Section 4.2's regional pools reduce the number of replicas?
+
+A: Each region has multiple clusters. Each cluster has a complete cache.
+Thus a given data item may be cached in each of the clusters. If there
+are N clusters in a region, there may be N distinct cached copies of a
+data item, one per cluster.
+
+Items that are cached in the regional pool are only cached once per
+region, not N times.
+
+The tradeoff is that the potential serving capacity is N times higher if
+there are N copies.
+
+Q: What storage system work has gone on at Facebook since this paper?
+
+A: Here's a sample:
+
+https://www.usenix.org/system/files/conference/atc13/atc13-bronson.pdf
+https://www.cs.princeton.edu/~wlloyd/papers/existential-sosp15.pdf
+
+Q: Why not just put a cache into MySQL, where it can be better
+integrated to provide good consistency?
+
+A: It would be fantastic if someone could add a transparent cache to
+MySQL that made it as fast as memcached. But no-one knows how to do
+that. MySQL in fact does quite a bit of caching, and it's still much
+slower than memcached. Presumably a lot of the reason is that MySQL
+presents a dramatically more powerful and complex interface than
+memcached (MySQL supports SQL queries, an interface which is about
+1000x as complex as memcached's put()/get()/delete).
