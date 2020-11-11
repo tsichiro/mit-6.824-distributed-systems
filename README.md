@@ -13,7 +13,6 @@ Spring 2020
 - Lecture 9: [More Replication, CRAQ](./chain-replication-craq.md)
 - Lecture 10: [Cloud Replicated DB, Aurora](./database-logging-quorums-amazon-aurora.md)
 - Lecture 11: [Cache Consistency: Frangipani](./cache-consistency-frangipani.md)
-- [Final Project](./final-project.md)
 - Lecture 12: [Distributed Transactions](./distributed-transactions.md)
 - Lecture 13: [Spanner](./spanner.md)
 - Lecture 14: [Optimistic Concurrency Control](./optimistic-concurrency-control.md)
@@ -24,4 +23,5 @@ Spring 2020
 - Lecture 19: [Peer-to-peer: Bitcoin](./peer-to-peer-bitcoin.md)
 - Lecture 20: [Blockstack](./blockstack.md)
 - Lecture 21: [Project demos](./project-demos.md)
+- [Final Project](./final-project.md)
 - [Exam](./exam.md)
