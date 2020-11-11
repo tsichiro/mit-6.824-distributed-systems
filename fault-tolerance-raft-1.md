@@ -1,4 +1,6 @@
-# [Raft (extended) (2014)](in-search-of-an-understandable-consensus-algorithm-extended-version.pdf)
+# Fault Tolerance: Raft (1)
+
+> [Raft (extended) (2014)](in-search-of-an-understandable-consensus-algorithm-extended-version.pdf)
 
 ## why are we reading this paper?
 
@@ -93,7 +95,8 @@ state machine replication with Raft -- Lab 3 as example:
   - k/v layer applies Put to DB, or fetches Get result
 - then leader replies to client w/ execution result
 
-why the logs?
+### why the logs?
+
 - the service keeps the state machine state, e.g. key/value DB
   - why isn't that enough?
 - it's important to number the commands
@@ -104,23 +107,27 @@ why the logs?
   - so the leader can re-send if a follower misses some
   - for persistence and replay after a reboot (next time)
 
-there are two main parts to Raft's design:
+### there are two main parts to Raft's design:
+
 - electing a new leader
 - ensuring identical logs despite failures
 
-*** topic: leader election (Lab 2A)
+#### *** topic: leader election (Lab 2A)
 
-why a leader?
+##### why a leader?
+
 - ensures all replicas execute the same commands, in the same order
 
-Raft numbers the sequence of leaders using "terms"
+##### Raft numbers the sequence of leaders using "terms"
+
 - new leader -> new term
 - a term has at most one leader; might have no leader
 - each election is also associated with one particular term
   - and there can only be one successful election per term
 - the term numbering helps servers follow latest leader, not superseded leader
 
-when does Raft start a leader election?
+##### when does Raft start a leader election?
+
 - AppendEntries are implied heartbeats; plus leader sends them periodically
 - if other server(s) don't hear from current leader for an "election timeout"
   - they assume the leader is down and start an election
@@ -129,7 +136,8 @@ when does Raft start a leader election?
 - note: this can lead to un-needed elections; that's slow but safe
 - note: old leader may still be alive and think it is the leader
 
-what happens when a server becomes candidate?
+##### what happens when a server becomes candidate?
+
 - three possibilities:
   - 1) gets majority, converts to leader
     - locally observes and counts votes
@@ -143,11 +151,10 @@ what happens when a server becomes candidate?
 - note: in case (3), it's possible to keep incrementing the term
   - but cannot add log entries, since in minority and not the leader
   - once partition heals, an election ensues because of the higher term
-  - but: either logs in majority partition are longer (so high-term
-    - candidate gets rejected) or they are same length if nothing happened
-    - in the majority partition (so high-term candidate can win, but no damage)
+  - but: either logs in majority partition are longer (so high-term candidate gets rejected) or they are same length if nothing happened in the majority partition (so high-term candidate can win, but no damage)
 
-how to ensure at most one leader in a term?
+##### how to ensure at most one leader in a term?
+
 - (Figure 2 RequestVote RPC and Rules for Servers)
 - leader must get "yes" votes from a majority of servers
 - each server can cast only one vote per term

@@ -1,7 +1,7 @@
-# Go, Threads, Crawler and RPC
+# Infrastructure: RPC and threads
 <!-- TOC -->
 
-- [Go, Threads, Crawler and RPC](#go-threads-crawler-and-rpc)
+- [Infrastructure: RPC and threads](#infrastructure-rpc-and-threads)
   - [Most commonly-asked question: Why Go?](#most-commonly-asked-question-why-go)
   - [Threads](#threads)
     - [Why threads?](#why-threads)

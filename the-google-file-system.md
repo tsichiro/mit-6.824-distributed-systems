@@ -1,27 +1,29 @@
-# [The Google File System](the-google-file-system.pdf)
+# The Google File System
+
+[The Google File System](the-google-file-system.pdf)
 
 Sanjay Ghemawat, Howard Gobioff, and Shun-Tak Leung
 SOSP 2003
 
 <!-- TOC -->
 
-- [[The Google File System](the-google-file-system.pdf)](#the-google-file-systemthe-google-file-systempdf)
-    - [Why are we reading this paper?](#why-are-we-reading-this-paper)
-    - [What is consistency?](#what-is-consistency)
-    - ["Ideal" consistency model](#ideal-consistency-model)
-    - [Challenges to achieving ideal consistency](#challenges-to-achieving-ideal-consistency)
-    - [GFS goals:](#gfs-goals)
-    - [High-level design / Reads](#high-level-design--reads)
-        - [Writes](#writes)
-        - [Record append](#record-append)
-    - [Housekeeping](#housekeeping)
-    - [Failures](#failures)
-    - [Does GFS achieve "ideal" consistency?](#does-gfs-achieve-ideal-consistency)
-        - [Authors claims weak consistency is not a big problems for apps](#authors-claims-weak-consistency-is-not-a-big-problems-for-apps)
-    - [Performance (Figure 3)](#performance-figure-3)
-    - [Summary](#summary)
-    - [References](#references)
-    - [GFS FAQ](#gfs-faq)
+- [The Google File System](#the-google-file-system)
+  - [Why are we reading this paper?](#why-are-we-reading-this-paper)
+  - [What is consistency?](#what-is-consistency)
+  - ["Ideal" consistency model](#ideal-consistency-model)
+  - [Challenges to achieving ideal consistency](#challenges-to-achieving-ideal-consistency)
+  - [GFS goals:](#gfs-goals)
+  - [High-level design / Reads](#high-level-design--reads)
+    - [Writes](#writes)
+    - [Record append](#record-append)
+  - [Housekeeping](#housekeeping)
+  - [Failures](#failures)
+  - [Does GFS achieve "ideal" consistency?](#does-gfs-achieve-ideal-consistency)
+    - [Authors claims weak consistency is not a big problems for apps](#authors-claims-weak-consistency-is-not-a-big-problems-for-apps)
+  - [Performance (Figure 3)](#performance-figure-3)
+  - [Summary](#summary)
+  - [References](#references)
+  - [GFS FAQ](#gfs-faq)
 
 <!-- /TOC -->
 ## Why are we reading this paper?
